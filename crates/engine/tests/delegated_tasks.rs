@@ -969,7 +969,7 @@ async fn a_notice_waits_in_the_queue_of_a_turn_boundary_delegator() {
     )
     .await;
     let rows = queue_rows(&core, "root");
-    assert_eq!(rows[0].id, "notice-b1");
+    assert!(rows[0].id.starts_with("notice-b1-"), "{}", rows[0].id);
     assert!(rows[0].text.starts_with("[Zeron task notice."));
     assert_eq!(rows[1].text, "ordinary row");
     assert_eq!(harness.runs_for("root").len(), 1, "no mid-turn run");
@@ -1024,7 +1024,7 @@ async fn a_notice_holds_while_the_delegator_waits_on_a_question() {
         || {
             queue_rows(&core, "root")
                 .iter()
-                .any(|r| r.id == "notice-b1")
+                .any(|r| r.id.starts_with("notice-b1-"))
         },
         "the notice to queue while the root waits",
     )
@@ -1102,7 +1102,7 @@ async fn a_notice_joins_a_frozen_queue_and_does_not_wake_a_stopped_delegator() {
         || {
             queue_rows(&core, "root")
                 .iter()
-                .any(|r| r.id == "notice-b1")
+                .any(|r| r.id.starts_with("notice-b1-"))
         },
         "the notice to join the frozen queue",
     )
@@ -1891,7 +1891,7 @@ async fn a_task_that_is_stopped_reports_at_once_even_with_tasks_running() {
         || {
             queue_rows(&core, "task-p")
                 .iter()
-                .any(|r| r.id == "notice-b-g")
+                .any(|r| r.id.starts_with("notice-b-g-"))
         },
         "G's notice waits in the frozen queue",
     )
@@ -1922,7 +1922,7 @@ async fn a_task_that_fails_reports_at_once_even_with_tasks_running() {
             notices(&core, "task-p").len() == 1
                 || queue_rows(&core, "task-p")
                     .iter()
-                    .any(|r| r.id == "notice-b-g")
+                    .any(|r| r.id.starts_with("notice-b-g-"))
                 || harness
                     .runs_for("task-p")
                     .iter()
@@ -2590,7 +2590,7 @@ async fn a_notice_waiting_in_a_queue_comes_back_frozen() {
         || {
             queue_rows(&core, "root")
                 .iter()
-                .any(|r| r.id == "notice-b1")
+                .any(|r| r.id.starts_with("notice-b1-"))
         },
         "the notice to queue behind the busy turn",
     )
@@ -2606,7 +2606,7 @@ async fn a_notice_waiting_in_a_queue_comes_back_frozen() {
         || {
             queue_rows(&core, "root")
                 .iter()
-                .any(|r| r.id == "notice-b1")
+                .any(|r| r.id.starts_with("notice-b1-"))
         },
         "the row to still be queued after restart",
     )
@@ -3477,5 +3477,196 @@ async fn a_turn_ended_before_any_reply_settles_interrupted_after_the_grace() {
     let notice = notices(&core, "root");
     assert_eq!(notice.len(), 1);
     assert!(notice[0].contains("interrupted"), "{}", notice[0]);
+    core.shutdown().await;
+}
+
+/// The delegation ledger file on disk (seals aren't exposed by `list()`).
+fn ledger_file(dir: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(
+        &std::fs::read(dir.join("orgs/dev-org/dev-user/delegations.json")).unwrap(),
+    )
+    .unwrap()
+}
+
+/// A member whose result already rode a progress notice re-arms as a FRESH
+/// member of the NEW batch — its next result must not be filtered as
+/// delivered, and no seal may exist for a batch it isn't in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivered_member_re_arms_into_the_new_batch() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    core.delegation.set_batch_progress_window(Duration::ZERO);
+    root(&core, "root");
+    delegate_run_unsealed(&client, &core, "root", "task-1", "b1", "job").await;
+    delegate_run_unsealed(&client, &core, "root", "task-2", "b1", "job").await;
+    core.delegation.seal_batch("root", "b1").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task-1 run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("RESULT-1"))
+        },
+        "the progress notice",
+    )
+    .await;
+    // Re-arm task-1 into a NEW batch: single-call arm seals it at once.
+    run_chat(&client, "task-1", "m-task-1b", "again", Some("b2")).await;
+    wait_for(
+        || {
+            ledger(&core)
+                .iter()
+                .any(|(id, batch, _)| id == "task-1" && batch == "b2")
+        },
+        "the re-arm into b2",
+    )
+    .await;
+    // The re-armed turn must be underway before finish() targets the run.
+    wait_for(
+        || {
+            core.sessions
+                .session_status("task-1")
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::Working)
+        },
+        "the re-armed turn",
+    )
+    .await;
+    harness.finish("task-1", Finish::Complete("RESULT-A2".into()));
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("RESULT-A2"))
+        },
+        "the re-armed result must not be filtered as delivered",
+    )
+    .await;
+    core.shutdown().await;
+}
+
+/// Re-arming a still-undelivered member keeps its old batch and must not
+/// leave a seal row behind for the caller's new batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undelivered_rearm_keeps_its_batch_and_makes_no_orphan_seal() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run_unsealed(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task-1 run").await;
+    // Second arm passes a different batch: the entry keeps b1.
+    queue_command(
+        &client,
+        "task-1",
+        SessionCommandPayload::Run {
+            request: run_request("again"),
+            message_id: "m-task-1b".into(),
+        },
+        Some(("b2", false)),
+    )
+    .await
+    .unwrap();
+    wait_for(
+        || {
+            ledger_file(dir.path())["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["messageId"] == "m-task-1b")
+        },
+        "the re-arm to persist",
+    )
+    .await;
+    let file = ledger_file(dir.path());
+    let rows = file["tasks"].as_array().unwrap();
+    let task = rows.iter().find(|t| t["chatId"] == "task-1").unwrap();
+    assert_eq!(task["batch"], "b1", "undelivered member keeps its batch");
+    let seals = file["seals"].as_array().unwrap();
+    assert!(
+        !seals.iter().any(|s| s["batch"] == "b2"),
+        "no seal for a batch the task isn't in: {seals:?}"
+    );
+    assert!(seals.iter().any(|s| s["batch"] == "b1"));
+    core.shutdown().await;
+}
+
+/// A seal row with no members is an orphan (its tasks were cancelled or
+/// released); each pass prunes it so the worker does not churn forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_memberless_seal_is_pruned() {
+    let (dir, core, _harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    core.delegation.arm("task-1", "b1", "m-task-1").unwrap();
+    core.delegation.inject_seal("root", "orphan");
+    core.delegation.run_pass().await;
+    let seals = ledger_file(dir.path())["seals"].as_array().unwrap().clone();
+    assert!(
+        !seals.iter().any(|s| s["batch"] == "orphan"),
+        "orphan seal pruned: {seals:?}"
+    );
+    assert!(
+        seals.iter().any(|s| s["batch"] == "b1"),
+        "the real seal survives: {seals:?}"
+    );
+    core.shutdown().await;
+}
+
+/// A re-arm landing between release's member read and its delivery must not
+/// be deleted — only the exact members that were read may be removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rearm_during_release_survives_the_cleanup() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task-1 run").await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    core.delegation.pause_release(rx);
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    // The settle runs release_batch, which parks at the gate after reading
+    // its members. Re-arm into the same batch while it holds.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    core.delegation
+        .arm("task-1", "b1", "m-task-1b")
+        .expect("re-arm during release");
+    let _ = tx.send(());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let rows = ledger(&core);
+    assert!(
+        rows.iter()
+            .any(|(id, _, settled)| id == "task-1" && !settled),
+        "the re-armed member survived: {rows:?}"
+    );
+    core.shutdown().await;
+}
+
+/// A task armed into a batch id AFTER that batch released (late arm past
+/// auto-seal, or deliberate reuse) must still deliver — its notice id is
+/// derived from the member set, not the bare batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_member_of_a_released_batch_gets_its_own_notice() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task-1 run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(|| ledger(&core).is_empty(), "batch b1 releases").await;
+    assert_eq!(notices(&core, "root").len(), 1);
+    // A second task armed into the same batch id is a different batch in
+    // practice: its result still lands as its own notice.
+    delegate_run(&client, &core, "root", "task-2", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-2").is_empty(), "task-2 run").await;
+    harness.finish("task-2", Finish::Complete("RESULT-2".into()));
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("RESULT-2"))
+        },
+        "the late member's notice",
+    )
+    .await;
+    assert_eq!(notices(&core, "root").len(), 2);
+    wait_for(|| ledger(&core).is_empty(), "the second batch clears").await;
     core.shutdown().await;
 }

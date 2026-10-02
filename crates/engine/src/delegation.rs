@@ -199,6 +199,9 @@ struct Inner {
     stale_arm_grace: Mutex<Duration>,
     /// Injectable progress-release window for tests (`BATCH_PROGRESS_AFTER`).
     batch_progress: Mutex<Duration>,
+    /// Test hook: pause `release_batch` between its member read and the
+    /// delivery await, so a re-arm racing the release can be observed.
+    release_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// Test hook: the next `save()` fails.
     fail_next_save: AtomicBool,
     /// Serializes every settle path: worker pass, rechecks, boot, cancel.
@@ -246,6 +249,7 @@ impl DelegationEngine {
                 auto_seal: Mutex::new(AUTO_SEAL),
                 stale_arm_grace: Mutex::new(STALE_ARM_GRACE),
                 batch_progress: Mutex::new(BATCH_PROGRESS_AFTER),
+                release_gate: Mutex::new(None),
                 fail_next_save: AtomicBool::new(false),
                 settle: tokio::sync::Mutex::new(()),
                 workspace,
@@ -352,15 +356,25 @@ impl DelegationEngine {
                 "notify works only for chats hosted on this device".into(),
             ));
         }
-        let undo = {
+        let (undo, effective_batch) = {
             let mut ledger = lock(&self.inner.ledger);
             match ledger.tasks.iter_mut().find(|t| t.chat_id == chat_id) {
                 Some(task) => {
                     let undo = ArmUndo(Some(task.clone()));
                     task.message_id = message_id.to_string();
                     task.settled = None;
+                    task.asked = None;
                     task.armed_at_ms = now_ms();
-                    undo
+                    // A member a progress notice already carried re-arms
+                    // fresh into the NEW batch — otherwise its next result
+                    // would be filtered as delivered. A still-undelivered
+                    // member keeps its batch: a late settle still belongs to
+                    // that batch's release.
+                    if task.delivered.is_some() {
+                        task.batch = batch.to_string();
+                        task.delivered = None;
+                    }
+                    (undo, task.batch.clone())
                 }
                 None => {
                     ledger.tasks.push(Armed {
@@ -373,21 +387,24 @@ impl DelegationEngine {
                         settled: None,
                         delivered: None,
                     });
-                    ArmUndo(None)
+                    (ArmUndo(None), batch.to_string())
                 }
             }
         };
+        // The seal belongs to the batch the task ACTUALLY armed into — a
+        // re-armed member keeping its old batch must not orphan a seal row
+        // for the caller's new batch.
         let mut created_seal = false;
         {
             let mut ledger = lock(&self.inner.ledger);
             if !ledger
                 .seals
                 .iter()
-                .any(|seal| seal.delegator == delegation.by && seal.batch == batch)
+                .any(|seal| seal.delegator == delegation.by && seal.batch == effective_batch)
             {
                 ledger.seals.push(Seal {
                     delegator: delegation.by.clone(),
-                    batch: batch.to_string(),
+                    batch: effective_batch.clone(),
                     sealed: false,
                     first_armed_at_ms: now_ms(),
                     last_progress_ms: 0,
@@ -409,9 +426,9 @@ impl DelegationEngine {
                 }
             }
             if created_seal {
-                ledger
-                    .seals
-                    .retain(|seal| !(seal.delegator == delegation.by && seal.batch == batch));
+                ledger.seals.retain(|seal| {
+                    !(seal.delegator == delegation.by && seal.batch == effective_batch)
+                });
             }
             return Err(err);
         }
@@ -560,6 +577,24 @@ impl DelegationEngine {
     #[doc(hidden)]
     pub async fn run_pass(&self) {
         let _settle = self.inner.settle.lock().await;
+        // Seals are pushed after their first member, so a memberless seal is
+        // always an orphan — a cancelled or released batch's leftovers.
+        let pruned = {
+            let mut ledger = lock(&self.inner.ledger);
+            let before = ledger.seals.len();
+            let live: std::collections::HashSet<(String, String)> = ledger
+                .tasks
+                .iter()
+                .map(|t| (t.delegator.clone(), t.batch.clone()))
+                .collect();
+            ledger
+                .seals
+                .retain(|seal| live.contains(&(seal.delegator.clone(), seal.batch.clone())));
+            ledger.seals.len() != before
+        };
+        if pruned && let Err(err) = self.save() {
+            tracing::warn!(error = %err, "delegation ledger write failed");
+        }
         self.auto_seal_expired();
         self.evaluate_all().await;
         self.release_complete_batches().await;
@@ -972,13 +1007,25 @@ impl DelegationEngine {
         // Members a progress notice already carried are not repeated. Every
         // member delivered (progress covered them all) skips only the notice —
         // the ledger cleanup and delegator re-evaluation below still run.
-        let members: Vec<Armed> = members
-            .into_iter()
+        let undelivered: Vec<Armed> = members
+            .iter()
             .filter(|t| t.delivered.is_none())
+            .cloned()
             .collect();
-        let notice_id = format!("notice-{batch}");
-        if !members.is_empty() && !self.notice_present(delegator, &notice_id) {
-            let text = self.build_notice(&notice_id, &members);
+        // Deterministic AND per-set: a batch id reused after release (a late
+        // arm past the seal window) must not dedup against the old notice.
+        let mut release_ids: Vec<String> = members
+            .iter()
+            .map(|t| format!("{}.{}", t.chat_id, t.message_id))
+            .collect();
+        release_ids.sort();
+        let notice_id = format!("notice-{batch}-{}", hex8(&release_ids.join(",")));
+        let gate = lock(&self.inner.release_gate).take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        if !undelivered.is_empty() && !self.notice_present(delegator, &notice_id) {
+            let text = self.build_notice(&notice_id, &undelivered);
             if let Err(err) = self
                 .inner
                 .doc_host
@@ -998,9 +1045,16 @@ impl DelegationEngine {
         }
         {
             let mut ledger = lock(&self.inner.ledger);
-            ledger
-                .tasks
-                .retain(|t| !(t.delegator == delegator && t.batch == batch));
+            // Remove only the members this release read and delivered — a
+            // re-arm that landed during the delivery await is a NEW task
+            // (new message_id), not part of this batch's settlement.
+            ledger.tasks.retain(|t| {
+                !(t.delegator == delegator
+                    && t.batch == batch
+                    && members
+                        .iter()
+                        .any(|m| m.chat_id == t.chat_id && m.message_id == t.message_id))
+            });
             // The batch is gone — so is its seal.
             ledger
                 .seals
@@ -1285,6 +1339,24 @@ impl DelegationEngine {
             })
             .collect();
         settle_notice_text(notice_id, &tasks)
+    }
+
+    /// Test hook: push a seal row as if a crashed arm had orphaned it.
+    #[doc(hidden)]
+    pub fn inject_seal(&self, delegator: &str, batch: &str) {
+        lock(&self.inner.ledger).seals.push(Seal {
+            delegator: delegator.into(),
+            batch: batch.into(),
+            sealed: true,
+            first_armed_at_ms: now_ms(),
+            last_progress_ms: 0,
+        });
+    }
+
+    /// Stall the next `release_batch` at its delivery boundary.
+    #[doc(hidden)]
+    pub fn pause_release(&self, rx: tokio::sync::oneshot::Receiver<()>) {
+        *lock(&self.inner.release_gate) = Some(rx);
     }
 
     /// `BATCH_PROGRESS_AFTER` override for tests.
