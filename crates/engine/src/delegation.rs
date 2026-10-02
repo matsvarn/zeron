@@ -96,6 +96,12 @@ struct Armed {
     armed_at_ms: i64,
     #[serde(default)]
     settled: Option<Settled>,
+    /// The batch progress notice that already carried this member's result
+    /// (its deterministic id); the final release must not repeat it. Marked
+    /// BEFORE the notice is delivered — a crash between the two is repaired
+    /// by the next pass noticing the id never landed.
+    #[serde(default)]
+    delivered: Option<String>,
 }
 
 /// A batch's release gate: an armed task's batch may contain members that
@@ -109,6 +115,10 @@ struct Seal {
     batch: String,
     sealed: bool,
     first_armed_at_ms: i64,
+    /// Last progress notice time (ms); the interval counts from the later of
+    /// this and `first_armed_at_ms`.
+    #[serde(default)]
+    last_progress_ms: i64,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -127,6 +137,11 @@ const AUTO_SEAL: Duration = Duration::from_secs(60);
 /// exhaustion) settles `errored` after this grace — the gap between arm and
 /// the command's execution is normally milliseconds.
 const STALE_ARM_GRACE: Duration = Duration::from_secs(30);
+/// A sealed batch with settled-undelivered results and members still working
+/// reports progress after this long — one stuck member must not hold every
+/// finished result forever.
+const BATCH_PROGRESS_AFTER: Duration = Duration::from_secs(15 * 60);
+
 /// Result text for a turn that never started.
 const NEVER_STARTED: &str =
     "The task's turn never started (the command was not queued or failed to start).";
@@ -182,6 +197,8 @@ struct Inner {
     auto_seal: Mutex<Duration>,
     /// Injectable stale-arm grace for tests (`STALE_ARM_GRACE`).
     stale_arm_grace: Mutex<Duration>,
+    /// Injectable progress-release window for tests (`BATCH_PROGRESS_AFTER`).
+    batch_progress: Mutex<Duration>,
     /// Test hook: the next `save()` fails.
     fail_next_save: AtomicBool,
     /// Serializes every settle path: worker pass, rechecks, boot, cancel.
@@ -228,6 +245,7 @@ impl DelegationEngine {
                 save_lock: Mutex::new(()),
                 auto_seal: Mutex::new(AUTO_SEAL),
                 stale_arm_grace: Mutex::new(STALE_ARM_GRACE),
+                batch_progress: Mutex::new(BATCH_PROGRESS_AFTER),
                 fail_next_save: AtomicBool::new(false),
                 settle: tokio::sync::Mutex::new(()),
                 workspace,
@@ -353,6 +371,7 @@ impl DelegationEngine {
                         asked: None,
                         armed_at_ms: now_ms(),
                         settled: None,
+                        delivered: None,
                     });
                     ArmUndo(None)
                 }
@@ -371,6 +390,7 @@ impl DelegationEngine {
                     batch: batch.to_string(),
                     sealed: false,
                     first_armed_at_ms: now_ms(),
+                    last_progress_ms: 0,
                 });
                 created_seal = true;
             }
@@ -543,12 +563,14 @@ impl DelegationEngine {
         self.auto_seal_expired();
         self.evaluate_all().await;
         self.release_complete_batches().await;
+        self.progress_release().await;
     }
 
     async fn boot_pass(&self) {
         self.auto_seal_expired();
         self.evaluate_all().await;
         self.release_complete_batches().await;
+        self.progress_release().await;
     }
 
     /// Every armed, unsettled task, checked after a status change. A small
@@ -769,6 +791,7 @@ impl DelegationEngine {
                 asked: None,
                 armed_at_ms: 0,
                 settled: None,
+                delivered: None,
             },
             outcome,
             None,
@@ -931,6 +954,14 @@ impl DelegationEngine {
             }
             members
         };
+        // Members a progress notice already carried are not repeated.
+        let members: Vec<Armed> = members
+            .into_iter()
+            .filter(|t| t.delivered.is_none())
+            .collect();
+        if members.is_empty() {
+            return;
+        }
         let notice_id = format!("notice-{batch}");
         if !self.notice_present(delegator, &notice_id) {
             let text = self.build_notice(&notice_id, &members);
@@ -971,6 +1002,159 @@ impl DelegationEngine {
             .any(|t| t.chat_id == delegator)
         {
             Box::pin(self.evaluate(delegator)).await;
+        }
+    }
+
+    /// Partial release: a sealed batch with fresh settled results and members
+    /// still working reports them after `BATCH_PROGRESS_AFTER` from the
+    /// batch's first arm or the last progress notice — one stuck member must
+    /// not hold every finished result. Members are marked `delivered` so the
+    /// final notice carries only the remainder.
+    async fn progress_release(&self) {
+        let window = *lock(&self.inner.batch_progress);
+        let now = now_ms();
+        let candidates: Vec<(String, String)> = {
+            let ledger = lock(&self.inner.ledger);
+            ledger
+                .seals
+                .iter()
+                .filter(|seal| seal.sealed)
+                .filter(|seal| {
+                    let members = || {
+                        ledger
+                            .tasks
+                            .iter()
+                            .filter(|t| t.delegator == seal.delegator && t.batch == seal.batch)
+                    };
+                    members().any(|t| t.settled.is_some() && t.delivered.is_none())
+                        && members().any(|t| t.settled.is_none())
+                        && now - seal.first_armed_at_ms.max(seal.last_progress_ms)
+                            >= window.as_millis() as i64
+                })
+                .map(|seal| (seal.delegator.clone(), seal.batch.clone()))
+                .collect()
+        };
+        for (delegator, batch) in candidates {
+            self.deliver_progress(&delegator, &batch).await;
+        }
+    }
+
+    async fn deliver_progress(&self, delegator: &str, batch: &str) {
+        // Repair first: members marked delivered whose notice never landed
+        // (crash between mark and deliver) go back into the eligible set.
+        {
+            let mut ledger = lock(&self.inner.ledger);
+            let mut repaired = false;
+            for task in ledger
+                .tasks
+                .iter_mut()
+                .filter(|t| t.delegator == delegator && t.batch == batch && t.settled.is_some())
+            {
+                if let Some(notice_id) = task.delivered.clone()
+                    && !self.notice_present(delegator, &notice_id)
+                {
+                    task.delivered = None;
+                    repaired = true;
+                }
+            }
+            if repaired && let Err(err) = self.save() {
+                tracing::warn!(error = %err, "delegation ledger write failed");
+            }
+        }
+        let (ready, open) = {
+            let ledger = lock(&self.inner.ledger);
+            let ready: Vec<Armed> = ledger
+                .tasks
+                .iter()
+                .filter(|t| {
+                    t.delegator == delegator
+                        && t.batch == batch
+                        && t.settled.is_some()
+                        && t.delivered.is_none()
+                })
+                .cloned()
+                .collect();
+            let open: Vec<Armed> = ledger
+                .tasks
+                .iter()
+                .filter(|t| t.delegator == delegator && t.batch == batch && t.settled.is_none())
+                .cloned()
+                .collect();
+            (ready, open)
+        };
+        if ready.is_empty() || open.is_empty() {
+            return;
+        }
+        // Deterministic id: same settled set ⇒ same notice — a retry or
+        // restart dedups on it.
+        let mut ids: Vec<&str> = ready.iter().map(|t| t.chat_id.as_str()).collect();
+        ids.sort();
+        let notice_id = format!("notice-{batch}-progress-{}", hex8(&ids.join(",")));
+        // Mark delivered BEFORE the notice lands: the members carry WHICH
+        // progress notice they rode on, so a crash between mark and delivery
+        // is repaired above instead of silently double-delivering.
+        {
+            let mut ledger = lock(&self.inner.ledger);
+            for task in ledger.tasks.iter_mut().filter(|t| {
+                t.delegator == delegator
+                    && t.batch == batch
+                    && t.settled.is_some()
+                    && ready
+                        .iter()
+                        .any(|r| r.chat_id == t.chat_id && r.message_id == t.message_id)
+            }) {
+                task.delivered = Some(notice_id.clone());
+            }
+            if let Some(seal) = ledger
+                .seals
+                .iter_mut()
+                .find(|s| s.delegator == delegator && s.batch == batch)
+            {
+                seal.last_progress_ms = now_ms();
+            }
+        }
+        if let Err(err) = self.save() {
+            tracing::warn!(error = %err, "delegation ledger write failed");
+        }
+        if !self.notice_present(delegator, &notice_id) {
+            let mut text = self.build_notice(&notice_id, &ready);
+            for task in &open {
+                let row = self.inner.workspace.chat(&task.chat_id).ok().flatten();
+                let title = sanitize_title(row.as_ref().and_then(|c| c.title.as_deref()));
+                let short_id = &task.chat_id[..8.min(task.chat_id.len())];
+                let harness = harness_label(row.as_ref());
+                let needs_input = self
+                    .inner
+                    .sessions
+                    .session_status(&task.chat_id)
+                    .is_some_and(|s| s.status == SessionStatus::AwaitingInput);
+                text.push_str(&format!(
+                    "\nStill working: \"{title}\" (chat {short_id}, {harness}){}",
+                    if needs_input { ", needs input" } else { "" },
+                ));
+            }
+            text.push_str("\nTheir results will follow in a separate message.");
+            if let Err(err) = self
+                .inner
+                .doc_host
+                .deliver_notice(delegator, &notice_id, &text)
+                .await
+                && !self.notice_present(delegator, &notice_id)
+            {
+                tracing::warn!(chat = %delegator, error = %err, "progress notice failed");
+                // Nothing landed: unmark so the result isn't lost.
+                let mut ledger = lock(&self.inner.ledger);
+                for task in ledger
+                    .tasks
+                    .iter_mut()
+                    .filter(|t| t.delivered.as_deref() == Some(notice_id.as_str()))
+                {
+                    task.delivered = None;
+                }
+                if let Err(err) = self.save() {
+                    tracing::warn!(error = %err, "delegation ledger write failed");
+                }
+            }
         }
     }
 
@@ -1093,6 +1277,12 @@ impl DelegationEngine {
     /// Callers on different paths (arm on the RPC path, settle on the
     /// watcher) race, so serialize + rename happens under `save_lock` and the
     /// last writer always holds the newest state.
+    /// `BATCH_PROGRESS_AFTER` override for tests.
+    #[doc(hidden)]
+    pub fn set_batch_progress_window(&self, window: Duration) {
+        *lock(&self.inner.batch_progress) = window;
+    }
+
     /// `auto_seal` override for tests.
     #[doc(hidden)]
     pub fn set_stale_arm_grace(&self, grace: Duration) {

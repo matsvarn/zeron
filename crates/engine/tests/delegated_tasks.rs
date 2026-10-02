@@ -3155,3 +3155,206 @@ async fn a_failed_ledger_save_rolls_back_the_arm() {
     );
     core.shutdown().await;
 }
+
+/// Arm a `Run` WITHOUT sealing — the `create_chats` shape — then seal
+/// explicitly once all members armed.
+async fn delegate_run_unsealed(
+    client: &RpcClient,
+    core: &EngineCore,
+    by: &str,
+    id: &str,
+    batch: &str,
+    prompt: &str,
+) {
+    delegate(client, &core.device_id, by, id, None)
+        .await
+        .unwrap();
+    core.workspace.rename_chat(id, id).unwrap();
+    queue_command(
+        client,
+        id,
+        SessionCommandPayload::Run {
+            request: run_request(prompt),
+            message_id: format!("m-{id}"),
+        },
+        Some((batch, false)),
+    )
+    .await
+    .expect("queue run command");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_progress_notice_reports_settled_results_while_a_member_works() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    core.delegation
+        .set_batch_progress_window(Duration::from_millis(300));
+    root(&core, "root");
+    delegate_run_unsealed(&client, &core, "root", "task-1", "b1", "job").await;
+    delegate_run_unsealed(&client, &core, "root", "task-2", "b1", "job").await;
+    core.delegation.seal_batch("root", "b1").await;
+    wait_for(
+        || !harness.runs_for("task-1").is_empty() && !harness.runs_for("task-2").is_empty(),
+        "both task runs",
+    )
+    .await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    // task-2 keeps working. After the window, a progress notice carries
+    // RESULT-1 plus the still-working line for task-2.
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("Still working"))
+        },
+        "the progress notice",
+    )
+    .await;
+    let progress = notices(&core, "root")
+        .into_iter()
+        .find(|n| n.contains("Still working"))
+        .unwrap();
+    assert!(progress.contains("RESULT-1"), "{progress}");
+    assert!(progress.contains("Still working: \"task-2\""), "{progress}");
+    assert!(
+        progress.contains("results will follow in a separate message"),
+        "{progress}"
+    );
+    // task-2 settles: the final notice carries ONLY it.
+    harness.finish("task-2", Finish::Complete("RESULT-2".into()));
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("RESULT-2"))
+        },
+        "the final notice",
+    )
+    .await;
+    let last = notices(&core, "root").into_iter().last().unwrap();
+    assert!(last.contains("RESULT-2"), "{last}");
+    assert!(!last.contains("RESULT-1"), "{last}");
+    assert!(ledger(&core).is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_progress_notice_is_not_redelivered_after_restart() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    core.delegation
+        .set_batch_progress_window(Duration::from_millis(300));
+    root(&core, "root");
+    delegate_run_unsealed(&client, &core, "root", "task-1", "b1", "job").await;
+    delegate_run_unsealed(&client, &core, "root", "task-2", "b1", "job").await;
+    core.delegation.seal_batch("root", "b1").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task-1 run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("RESULT-1"))
+        },
+        "the progress notice",
+    )
+    .await;
+    core.shutdown().await;
+    drop(core);
+
+    // Restart: the delivered member must not re-notice — its progress notice
+    // stays the only carrier of RESULT-1.
+    let harness2 = Held::new(SteeringMode::StepBoundary);
+    let core2 = assemble_at(dir.path(), harness2.clone());
+    core2.sessions.set_ipc_port(27655);
+    let client2 = zeron_rpc::memory_client(core2.rpc_service());
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let result_1_notices = |core: &EngineCore| {
+        notices(core, "root")
+            .iter()
+            .filter(|n| n.contains("RESULT-1"))
+            .count()
+    };
+    assert_eq!(result_1_notices(&core2), 1, "no redelivery after restart");
+    // task-2's run died with the old engine: cancel it and the batch
+    // releases its one remaining member with no repeat of RESULT-1.
+    client2
+        .call(
+            methods::CANCEL_DELEGATED_TASK,
+            serde_json::json!({ "chatId": "task-2" }),
+        )
+        .await
+        .unwrap();
+    wait_for(|| ledger(&core2).is_empty(), "the batch to clear").await;
+    assert_eq!(result_1_notices(&core2), 1);
+    core2.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fully_unsettled_batch_gets_no_progress_notice() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    core.delegation.set_batch_progress_window(Duration::ZERO);
+    root(&core, "root");
+    delegate_run_unsealed(&client, &core, "root", "task-1", "b1", "job").await;
+    delegate_run_unsealed(&client, &core, "root", "task-2", "b1", "job").await;
+    core.delegation.seal_batch("root", "b1").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task-1 run").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        notices(&core, "root").is_empty(),
+        "nothing settled — no progress spam"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_progress_notice_marks_a_waiting_member_as_needing_input() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    core.delegation.set_batch_progress_window(Duration::ZERO);
+    root(&core, "root");
+    delegate_run_unsealed(&client, &core, "root", "task-1", "b1", "job").await;
+    delegate_run_unsealed(&client, &core, "root", "task-2", "b1", "job").await;
+    core.delegation.seal_batch("root", "b1").await;
+    wait_for(
+        || !harness.runs_for("task-1").is_empty() && !harness.runs_for("task-2").is_empty(),
+        "both task runs",
+    )
+    .await;
+    // Park task-2 on its question FIRST so the progress notice's needs-input
+    // flag sees AwaitingInput, then settle task-1.
+    harness.finish(
+        "task-2",
+        Finish::Question(vec![UserInputQuestion {
+            id: "q1".into(),
+            header: "Choose".into(),
+            question: "pick one".into(),
+            options: vec!["a".into()],
+            prefill: None,
+            multiline: false,
+            multi_select: false,
+        }]),
+    );
+    wait_for(
+        || {
+            core.sessions
+                .session_status("task-2")
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::AwaitingInput)
+        },
+        "task-2 to park on its question",
+    )
+    .await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("Still working"))
+        },
+        "the progress notice",
+    )
+    .await;
+    let progress = notices(&core, "root")
+        .into_iter()
+        .find(|n| n.contains("Still working"))
+        .unwrap();
+    assert!(progress.contains("needs input"), "{progress}");
+    core.shutdown().await;
+}
