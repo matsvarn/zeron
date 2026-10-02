@@ -337,6 +337,20 @@ impl SessionsEngine {
         *lock(&self.inner.wake_timeout) = timeout;
     }
 
+    /// A run handle exists for this chat — its turn was dispatched and has
+    /// not ended. Status can transiently read Idle while the dispatch and
+    /// the Working stamp race a reader.
+    pub fn run_registered(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
+    }
+
+    /// Test hook: drop the status entry without ending the run — the window
+    /// between `runs.insert` and the Working stamp, or a lost status write.
+    #[doc(hidden)]
+    pub fn clear_status_for_test(&self, chat_id: &str) {
+        lock(&self.inner.statuses).remove(chat_id);
+    }
+
     /// A crash-recovery re-dispatch is in flight for this chat: its status
     /// reads Idle for a moment, but its turn is starting over, not over.
     pub fn is_reviving(&self, chat_id: &str) -> bool {

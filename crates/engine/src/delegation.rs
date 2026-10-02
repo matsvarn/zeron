@@ -873,7 +873,16 @@ impl DelegationEngine {
             .rev()
             .find(|e| e.role == MessageRole::Assistant)
         {
-            None => IdleVerdict::Settled(Outcome::Interrupted),
+            None => {
+                // No assistant entry after the armed message: the command
+                // resolves Applied only AFTER dispatch registered the run —
+                // a registered run means the turn is still starting, not
+                // over; an unregistered one ended before replying.
+                if self.inner.sessions.run_registered(&task.chat_id) {
+                    return IdleVerdict::Owed;
+                }
+                IdleVerdict::Settled(Outcome::Interrupted)
+            }
             Some(entry) if entry.status == Some(MessageStatus::Aborted) => {
                 // A revived crash: the turn is starting over, not over.
                 if self.inner.sessions.is_reviving(&task.chat_id) {
@@ -924,6 +933,12 @@ impl DelegationEngine {
                     at_ms: now_ms(),
                     note: note.map(str::to_owned),
                 });
+                tracing::info!(
+                    chat = %task.chat_id,
+                    outcome = ?outcome,
+                    note = note.unwrap_or(""),
+                    "delegation task settled"
+                );
             }
         }
         if let Err(err) = self.save() {

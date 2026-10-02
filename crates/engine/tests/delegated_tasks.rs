@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zeron_doc::{
-    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionMessageEntry,
+    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
+    SessionCommandStatus, SessionMessageEntry,
 };
 use zeron_engine::delegation::{self, NoticeTask, Outcome};
 use zeron_engine::{EngineCore, HarnessRegistry};
@@ -1274,7 +1275,7 @@ async fn an_armed_message_held_behind_a_running_turn_reports_the_later_turn() {
     harness.finish("task-1", Finish::Complete("SECOND-RESULT".into()));
     wait_for(|| notices(&core, "root").len() == 1, "one notice").await;
     assert!(notices(&core, "root")[0].contains("SECOND-RESULT"));
-    assert!(ledger(&core).is_empty());
+    wait_for(|| ledger(&core).is_empty(), "the batch to release").await;
     core.shutdown().await;
 }
 
@@ -3392,5 +3393,89 @@ async fn a_fully_delivered_batch_releases_when_its_last_member_is_cancelled() {
     let count = notices(&core, "root").len();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(notices(&core, "root").len(), count, "no further notice");
+    core.shutdown().await;
+}
+
+/// Push an already-resolved Run command + its user message straight into the
+/// doc — the exact "dispatch consumed the command, no assistant entry yet"
+/// window a live turn start passes through.
+fn applied_command(core: &EngineCore, chat: &str, message_id: &str) {
+    let doc = core.doc_host.open(chat).unwrap();
+    doc.doc()
+        .push_message(&message(
+            message_id,
+            MessageRole::User,
+            "job",
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+    doc.doc()
+        .queue_command(&SessionCommandEntry {
+            id: format!("c-{message_id}"),
+            payload: SessionCommandPayload::Run {
+                request: run_request("job"),
+                message_id: message_id.to_string(),
+            },
+            issued_by: "device".into(),
+            issued_at: 1,
+            based_on: None,
+            expires_at: None,
+            status: SessionCommandStatus::Applied,
+            resolution: None,
+        })
+        .unwrap();
+}
+
+/// REGRESSION: between dispatch registering the run and the first assistant
+/// event, a status tick could read the chat as Idle with no assistant entry
+/// and settle `interrupted` — the live 5-task batch lost its pi and devin
+/// members this way while they were genuinely working. A registered run
+/// means the turn is still starting, not over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dispatched_turn_with_no_assistant_entry_is_not_interrupted() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    // The live window: run registered (dispatched, not ended) but the status
+    // read returns Idle and no assistant entry has landed yet.
+    core.sessions.clear_status_for_test("task-1");
+    core.delegation.run_pass().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = ledger(&core);
+    assert!(
+        rows.iter()
+            .any(|(id, _, settled)| id == "task-1" && !settled),
+        "the starting turn must stay armed, got {rows:?}"
+    );
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(|| ledger(&core).is_empty(), "the batch to release").await;
+    let notice = notices(&core, "root");
+    assert_eq!(notice.len(), 1);
+    assert!(notice[0].contains("completed"), "{}", notice[0]);
+    assert!(notice[0].contains("RESULT-1"), "{}", notice[0]);
+    core.shutdown().await;
+}
+
+/// The same state PAST the arm grace — a run that genuinely ended before
+/// replying — still settles interrupted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_ended_before_any_reply_settles_interrupted_after_the_grace() {
+    let (_dir, core, _harness, client) = setup(SteeringMode::StepBoundary).await;
+    core.delegation.set_stale_arm_grace(Duration::ZERO);
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    applied_command(&core, "task-1", "m-task-1");
+    core.delegation
+        .arm("task-1", "b1", "m-task-1")
+        .expect("arm");
+    core.delegation.seal_batch("root", "b1").await;
+    core.delegation.run_pass().await;
+    wait_for(|| ledger(&core).is_empty(), "the batch to release").await;
+    let notice = notices(&core, "root");
+    assert_eq!(notice.len(), 1);
+    assert!(notice[0].contains("interrupted"), "{}", notice[0]);
     core.shutdown().await;
 }
