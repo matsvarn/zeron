@@ -954,12 +954,18 @@ impl WorkspaceHost {
                 }
             }
             // Nested tasks list under the root, not under their delegator.
-            parent_chat_id = Some(
-                delegator
-                    .parent_chat_id
-                    .clone()
-                    .unwrap_or_else(|| delegator.id.clone()),
-            );
+            let root = delegator
+                .parent_chat_id
+                .clone()
+                .unwrap_or_else(|| delegator.id.clone());
+            if let Some(explicit) = parent_chat_id.as_deref()
+                && explicit != root
+            {
+                return Err(EngineError::Other(format!(
+                    "parentChatId conflicts with delegatedBy: a delegated task lists under its root chat {root}."
+                )));
+            }
+            parent_chat_id = Some(root);
             delegation = Some(Delegation {
                 by: delegator.id,
                 depth,

@@ -34,7 +34,9 @@ use zeron_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, SubagentStatus,
     evaluate_command, join_continuation_entries,
 };
-use zeron_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
+use zeron_proto::{
+    ConversationSourceContext, HarnessId, SessionStatus, UserInputAnswer, UserInputQuestion,
+};
 use zeron_sync::DocsStore;
 
 use crate::http_error::describe_http_error;
@@ -5351,6 +5353,66 @@ impl DocHost {
                 ))
             }
         }
+    }
+
+    /// Deliver a delegated-task notice to its delegator
+    /// (docs/design/delegated-tasks.md). Distinct from `queue_message`/`deliver_prompt`
+    /// on purpose: never revives an archived chat, never thaws a queue the user
+    /// stopped, never interrupts a turn — a stopped or question-blocked
+    /// delegator finds the notice waiting at the queue's steer slot.
+    pub async fn deliver_notice(
+        &self,
+        delegator: &str,
+        notice_id: &str,
+        text: &str,
+    ) -> Result<(), EngineError> {
+        match self
+            .workspace()
+            .and_then(|ws| ws.chat(delegator).ok().flatten())
+        {
+            // Deleted or archived: drop the notice. The result stays readable
+            // through the task's transcript.
+            None => return Ok(()),
+            Some(chat) if chat.archived => return Ok(()),
+            _ => {}
+        }
+        let Some(sessions) = self.sessions() else {
+            return Err(EngineError::Other("sessions engine not wired".into()));
+        };
+        let handle = self.open(delegator)?;
+        let frozen = handle.queue_paused.load(Ordering::Acquire);
+        let awaiting_input = sessions
+            .session_status(delegator)
+            .is_some_and(|s| s.status == SessionStatus::AwaitingInput);
+        if frozen || awaiting_input {
+            let item = QueuedMessage {
+                id: notice_id.to_string(),
+                text: text.to_string(),
+                attachments: Vec::new(),
+                hold_for_turn_end: false,
+                issued_by: self.inner.config.device_id.clone(),
+                issued_at: now_ms(),
+                edited_at: None,
+                delivery_gate: None,
+            };
+            if handle.doc.read_queue()?.iter().any(|row| row.id == item.id) {
+                return Ok(()); // retry of a delivered insert
+            }
+            handle
+                .doc
+                .insert_queued(handle.steer_slot(&item.id)?, &item)?;
+            handle.publish_queue();
+            return Ok(());
+        }
+        self.deliver_prompt(
+            &sessions,
+            &handle,
+            text,
+            Some(notice_id.to_string()),
+            now_ms(),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Park a prompt for a turn-boundary agent in the visible queue instead

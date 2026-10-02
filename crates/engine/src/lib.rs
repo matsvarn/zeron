@@ -20,6 +20,7 @@ pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
 mod chat_persistence;
+pub mod delegation;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod harness_updates;
@@ -141,6 +142,8 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub harness_updates: harness_updates::HarnessUpdateCoordinator,
+    /// Delegated-task ledger + settle watcher (docs/design/delegated-tasks.md).
+    pub delegation: delegation::DelegationEngine,
     pub device_id: String,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
@@ -251,6 +254,15 @@ impl EngineCore {
             Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
             Err(err) => tracing::error!(error = %err, "stale-session recovery failed"),
         }
+        // Delegated tasks: after revive decisions are final, boot-evaluate the
+        // ledger and start the settle watcher.
+        let delegation = delegation::DelegationEngine::open(
+            profile.store_root(),
+            workspace.clone(),
+            doc_host.clone(),
+            sessions.clone(),
+        );
+        delegation.start();
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
         doc_host.set_repos(repos.clone());
@@ -334,6 +346,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             harness_updates,
+            delegation,
             device_id,
             local_import,
             workspace_scope: profile.scope(),
@@ -466,6 +479,7 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
+        .with_delegation(self.delegation.clone())
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
         .with_harness_updates(self.harness_updates.clone());
@@ -503,6 +517,7 @@ impl EngineCore {
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        self.delegation.shutdown().await;
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();

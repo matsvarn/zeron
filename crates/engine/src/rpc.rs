@@ -140,11 +140,21 @@ struct SetHarnessUpdatePolicyParams {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+    /// Delegated-task arming: `notify: { batch }` records that this command's
+    /// turn owes the chat's delegator a notice.
+    #[serde(default)]
+    notify: Option<NotifyParams>,
     /// Queued attachments (bytes already committed locally as `pending://`
     /// refs) the engine delivers to a remote host AFTER the command is
     /// durably queued — never as a gate in front of it.
     #[serde(default)]
     transfers: Vec<crate::uploads::AttachmentTransfer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotifyParams {
+    batch: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -614,6 +624,7 @@ enum MutateParams {
 
 pub struct EngineRpc {
     sessions: SessionsEngine,
+    delegation: Option<crate::delegation::DelegationEngine>,
     doc_host: DocHost,
     workspace: WorkspaceHost,
     registry: std::sync::Arc<HarnessRegistry>,
@@ -659,6 +670,7 @@ impl EngineRpc {
         };
         Self {
             sessions,
+            delegation: None,
             doc_host,
             workspace,
             registry,
@@ -682,6 +694,13 @@ impl EngineRpc {
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
         self.previews = Some(previews);
+        self
+    }
+
+    /// Attach the delegation engine (`QueueCommand.notify` arming + settle
+    /// watcher backing it).
+    pub fn with_delegation(mut self, delegation: crate::delegation::DelegationEngine) -> Self {
+        self.delegation = Some(delegation);
         self
     }
 
@@ -1825,6 +1844,29 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                if let Some(notify) = &p.notify {
+                    // Arm BEFORE the command lands so a fast turn cannot
+                    // settle before the engine knows a notice is owed.
+                    let message_id = match &p.command {
+                        SessionCommandPayload::Run { message_id, .. } => Some(message_id.clone()),
+                        SessionCommandPayload::Steer { message_id, .. } => message_id.clone(),
+                        _ => None,
+                    };
+                    let message_id =
+                        message_id
+                            .filter(|id| !id.trim().is_empty())
+                            .ok_or_else(|| {
+                                RpcError::Failed(
+                                    "notify requires a Run or Steer command with a message id"
+                                        .into(),
+                                )
+                            })?;
+                    self.delegation
+                        .as_ref()
+                        .ok_or_else(|| RpcError::Failed("delegation engine not wired".into()))?
+                        .arm(&p.chat_id, &notify.batch, &message_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
                 let command_id = self
                     .doc_host
                     .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
