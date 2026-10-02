@@ -47,6 +47,25 @@ pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// `ZERON_FORK_BUILD=1` at compile time (scripts/package-macos-fork.sh sets
+/// it): a forked bundle must never self-replace with a stock release —
+/// checks, downloads, applies, and the update UI are all inert.
+pub fn fork_build() -> bool {
+    option_env!("ZERON_FORK_BUILD").is_some()
+}
+
+/// The version as shown to the user. Forked builds append a marker so the
+/// bundle is distinguishable from stock Zeron without changing the parsed
+/// cargo version.
+pub fn display_version() -> String {
+    if fork_build() {
+        let sha = option_env!("ZERON_FORK_SHA").unwrap_or("dev");
+        format!("{} · orchestrator {}", current_version(), sha)
+    } else {
+        current_version().to_string()
+    }
+}
+
 /// Successful checks repeat this often. The feed is a sub-kilobyte,
 /// edge-cached document, so hourly polling is free and bounds how long a
 /// long-running app can sit on a stale release.
@@ -388,6 +407,9 @@ impl std::fmt::Display for UpdateBlocker {
 impl InstallKind {
     /// Whether the desktop app downloads and installs updates itself.
     pub fn supports_desktop_update(&self) -> bool {
+        if fork_build() {
+            return false;
+        }
         match self {
             Self::MacApp { .. } => true,
             // The desktop path relaunches a GUI binary; on Linux that binary
@@ -422,6 +444,9 @@ impl InstallKind {
         manifest: &Manifest,
         data_dir: &Path,
     ) -> anyhow::Result<PathBuf> {
+        if fork_build() {
+            bail!("updates are disabled in this build");
+        }
         match self {
             Self::MacApp { .. } => stage_mac_app(edge_url, manifest, data_dir).await,
             Self::Managed { app_root } if self.supports_desktop_update() => {
@@ -440,6 +465,9 @@ impl InstallKind {
     /// effect at the next launch ("install on quit"). Either way the caller
     /// must quit after this succeeds.
     pub fn apply_desktop(&self, staged: &Path, relaunch: bool) -> anyhow::Result<()> {
+        if fork_build() {
+            bail!("updates are disabled in this build");
+        }
         match self {
             Self::MacApp { bundle } => {
                 apply_mac_app(staged, bundle)?;
@@ -983,14 +1011,18 @@ impl UpdateStatus {
 
 /// `ZERON_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
 fn auto_update_enabled() -> bool {
-    std::env::var("ZERON_AUTO_UPDATE")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    !fork_build()
+        && std::env::var("ZERON_AUTO_UPDATE")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
 }
 
 /// `ZERON_AUTO_UPDATE=0|false|no` — the desktop app then only reports: no
 /// background download and no install on quit. Unset means on.
 pub fn desktop_auto_update_enabled() -> bool {
+    if fork_build() {
+        return false;
+    }
     std::env::var("ZERON_AUTO_UPDATE")
         .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
         .unwrap_or(true)
@@ -1144,6 +1176,10 @@ impl Updater {
     }
 
     async fn check_loop(&self, mut wakes: watch::Receiver<u64>, initial_delay: Duration) {
+        if fork_build() {
+            // Forked builds never check: no feed fetch, no download, no apply.
+            return;
+        }
         let mut shutdown = self.shutdown_tx.subscribe();
         // Shutdown must cut the loop at ANY await point — including mid
         // `check_once()` / `auto_apply_when_idle()` HTTP — so the whole body
@@ -1285,6 +1321,9 @@ impl Updater {
     /// after all network and staging I/O and directly before the destructive
     /// swap/restart boundary; `None` tells the caller to wait and try again.
     async fn apply_inner(&self, require_quiescent: bool) -> anyhow::Result<Option<String>> {
+        if fork_build() {
+            bail!("updates are disabled in this build");
+        }
         let InstallKind::Managed { app_root } = detect_install() else {
             bail!(
                 "this install is not update-managed — the desktop app updates from its UI; \

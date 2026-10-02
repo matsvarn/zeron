@@ -17,9 +17,13 @@ command -v cargo >/dev/null 2>&1 || PATH="$HOME/.cargo/bin:$PATH"
 VERSION="$(grep -m1 '^version' "$ROOT/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 ARCH="$(uname -m)" # arm64 on Apple silicon runners
 OUT_DIR="$ROOT/target/package"
-APP="$OUT_DIR/Zeron.app"
-DMG="$OUT_DIR/zeron-$VERSION-macos-$ARCH.dmg"
-APP_TARBALL="$OUT_DIR/zeron-$VERSION-macos-$ARCH-app.tar.gz"
+# Forked packaging (scripts/package-macos-fork.sh) overrides these.
+APP_NAME="${ZERON_APP_NAME:-Zeron}"
+BUNDLE_ID="${ZERON_BUNDLE_ID:-sh.zeron.app}"
+APP_SLUG="$(echo "$APP_NAME" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-')"
+APP="$OUT_DIR/$APP_NAME.app"
+DMG="$OUT_DIR/$APP_SLUG-$VERSION-macos-$ARCH.dmg"
+APP_TARBALL="$OUT_DIR/$APP_SLUG-$VERSION-macos-$ARCH-app.tar.gz"
 
 cd "$ROOT"
 cargo build --release -p zeron
@@ -27,7 +31,10 @@ cargo build --release -p zeron
 rm -rf "$APP" "$DMG" "$APP_TARBALL"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/zeron" "$APP/Contents/MacOS/zeron"
-sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
+sed -e "s/__VERSION__/$VERSION/" \
+    -e "s|<string>Zeron</string>|<string>$APP_NAME</string>|g" \
+    -e "s|<string>sh.zeron.app</string>|<string>$BUNDLE_ID</string>|" \
+    "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 mkdir -p "$APP/Contents/Resources/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$APP/Contents/Resources/licenses/fonts/"
 
@@ -80,7 +87,7 @@ if $NOTARIZE; then
 fi
 
 # The auto-updater artifact.
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" Zeron.app
+tar -czf "$APP_TARBALL" -C "$OUT_DIR" "$APP_NAME.app"
 echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the
@@ -97,14 +104,15 @@ BG_TIFF="$OUT_DIR/dmg-background.tiff"
 tiffutil -cathidpicheck "$ROOT/dist/macos/dmg-background.png" \
   "$ROOT/dist/macos/dmg-background@2x.png" -out "$BG_TIFF" >/dev/null 2>&1
 
-APP="$APP" DMG="$DMG" BG_TIFF="$BG_TIFF" python3 - <<'PY'
+APP="$APP" APP_NAME="$APP_NAME" DMG="$DMG" BG_TIFF="$BG_TIFF" python3 - <<'PY'
 import os
 import dmgbuild
 
 app = os.environ["APP"]
+app_name = os.environ["APP_NAME"]
 dmgbuild.build_dmg(
     filename=os.environ["DMG"],
-    volume_name="Zeron",
+    volume_name=app_name,
     settings={
         "format": "UDZO",
         "files": [app],
@@ -121,7 +129,7 @@ dmgbuild.build_dmg(
         "window_rect": ((200, 120), (660, 400)),
         "icon_size": 104,
         "text_size": 12,
-        "icon_locations": {"Zeron.app": (165, 195), "Applications": (495, 195)},
+        "icon_locations": {app_name: (165, 195), "Applications": (495, 195)},
     },
 )
 PY

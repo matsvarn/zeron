@@ -8369,7 +8369,7 @@ impl Shell {
         use crate::app_update::{AppUpdate, Flow, Prompt};
         let update = AppUpdate::global(cx)?;
         let theme = Theme::of(cx).for_popup();
-        let current = zeron_update::current_version();
+        let current = zeron_update::display_version();
         let (title, body, buttons): (SharedString, SharedString, Vec<UpdatePromptButton>) = {
             let update = update.read(cx);
             match update.prompt()? {
