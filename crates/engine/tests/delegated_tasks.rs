@@ -411,7 +411,11 @@ fn blocks(notice: &str) -> Vec<String> {
 }
 
 fn ledger(core: &EngineCore) -> Vec<(String, String, bool)> {
-    core.delegation.armed()
+    core.delegation
+        .list()
+        .into_iter()
+        .map(|e| (e.chat_id, e.batch, e.notice == "settled"))
+        .collect()
 }
 
 fn message(id: &str, role: MessageRole, text: &str, status: MessageStatus) -> SessionMessageEntry {
@@ -1186,8 +1190,11 @@ async fn a_follow_up_with_notify_arms_the_task_again() {
     delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
     wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
     harness.finish("task-1", Finish::Complete("RESULT-1".into()));
-    wait_for(|| notices(&core, "root").len() == 1, "the first notice").await;
-    assert!(ledger(&core).is_empty());
+    wait_for(
+        || notices(&core, "root").len() == 1 && ledger(&core).is_empty(),
+        "the first notice",
+    )
+    .await;
 
     run_chat(&client, "task-1", "m-task-2", "follow-up", Some("b2")).await;
     wait_for(
@@ -1919,5 +1926,125 @@ async fn notify_needs_a_message_id() {
     .to_string();
     assert!(err.contains("message id"), "unexpected error: {err}");
     assert!(ledger(&core).is_empty());
+    core.shutdown().await;
+}
+
+// ── settle-path races and repair ────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_interrupted_task_does_not_report_an_earlier_reply() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish("task-1", Finish::Complete("OLD-1".into()));
+    wait_for(|| notices(&core, "root").len() == 1, "the first notice").await;
+
+    // Re-armed, then interrupted before the second turn writes anything:
+    // the notice must not quote the earlier turn's reply.
+    run_chat(&client, "task-1", "m-task-2", "again", Some("b2")).await;
+    wait_for(
+        || harness.runs_for("task-1").len() == 2,
+        "the re-armed turn to start",
+    )
+    .await;
+    queue_command(&client, "task-1", SessionCommandPayload::Interrupt {}, None)
+        .await
+        .unwrap();
+    wait_for(
+        || notices(&core, "root").len() == 2,
+        "the interrupted notice",
+    )
+    .await;
+    let notice = &notices(&core, "root")[1];
+    assert!(notice.contains(": interrupted"), "got: {notice}");
+    assert!(
+        notice.contains("The task was interrupted before it finished."),
+        "got: {notice}"
+    );
+    assert!(
+        !notice.contains("OLD-1"),
+        "quoted an earlier turn: {notice}"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_queue_command_disarms_the_task() {
+    // `queue_command_with_transfers` has no reachable failure for a local chat
+    // (the doc always opens once the row exists), so the rollback is exercised
+    // at the engine boundary the RPC drives: arm, then disarm with the undo.
+    let (_dir, core, _harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+
+    let undo = core.delegation.arm("task-1", "b1", "m-task-1").unwrap();
+    assert_eq!(ledger(&core).len(), 1);
+    core.delegation.disarm("task-1", undo);
+    assert!(ledger(&core).is_empty(), "a failed queue leaves no entry");
+
+    // A re-arm's undo restores the previous message id + settled state.
+    core.delegation.arm("task-1", "b1", "m-task-1").unwrap();
+    let undo = core.delegation.arm("task-1", "b2", "m-task-2").unwrap();
+    core.delegation.disarm("task-1", undo);
+    let entries = core.delegation.list();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].batch, "b1", "re-arm keeps the first batch");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_settle_paths_deliver_one_notice() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    // Freeze the watcher so the task can only settle through explicit passes.
+    core.delegation.shutdown().await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        ledger(&core).len(),
+        1,
+        "the watcher is off; nothing settled"
+    );
+
+    // Two settle paths at once (status tick + boot-style pass): one notice.
+    let (a, b) = tokio::join!(core.delegation.run_pass(), core.delegation.run_pass());
+    let _ = (a, b);
+    assert_eq!(notices(&core, "root").len(), 1, "exactly one notice lands");
+    assert!(ledger(&core).is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_ledger_is_moved_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let root_dir = dir.path().join("orgs/dev-org/dev-user");
+    std::fs::create_dir_all(&root_dir).unwrap();
+    std::fs::write(root_dir.join("delegations.json"), b"not json{{").unwrap();
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness);
+    core.sessions.set_ipc_port(27655);
+    let aside: Vec<_> = std::fs::read_dir(&root_dir)
+        .unwrap()
+        .filter_map(|e| {
+            e.ok()
+                .and_then(|e| e.file_name().to_str().map(str::to_owned))
+        })
+        .filter(|n| n.starts_with("delegations.json.corrupt-"))
+        .collect();
+    assert_eq!(aside.len(), 1, "the corrupt file was moved aside");
+    // The engine still arms and settles normally.
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    core.delegation.arm("task-1", "b1", "m-1").unwrap();
+    assert_eq!(ledger(&core).len(), 1);
     core.shutdown().await;
 }

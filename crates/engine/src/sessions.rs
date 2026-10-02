@@ -171,6 +171,10 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Chats with a crash-recovery re-dispatch in flight: the status row is
+    /// briefly Idle between `recover_stale`'s stamp and the revived run's
+    /// Working, and a settle observer must not read that window as "ended".
+    reviving: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -208,6 +212,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                reviving: Mutex::new(std::collections::HashSet::new()),
             }),
         }
     }
@@ -275,6 +280,12 @@ impl SessionsEngine {
     /// Status watch: the full session list, re-sent on every transition.
     pub fn watch_sessions(&self) -> watch::Receiver<Vec<Session>> {
         self.inner.sessions_tx.subscribe()
+    }
+
+    /// A crash-recovery re-dispatch is in flight for this chat: its status
+    /// reads Idle for a moment, but its turn is starting over, not over.
+    pub fn is_reviving(&self, chat_id: &str) -> bool {
+        lock(&self.inner.reviving).contains(chat_id)
     }
 
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
@@ -904,6 +915,7 @@ impl SessionsEngine {
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();
+            lock(&sessions.inner.reviving).insert(chat_id.clone());
             tokio::spawn(async move {
                 let Some(host) = sessions.inner.doc_host() else {
                     return;
@@ -931,6 +943,7 @@ impl SessionsEngine {
                         })
                     });
                 let Some(mut request) = request else {
+                    lock(&sessions.inner.reviving).remove(&chat_id);
                     tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
                     return;
                 };
@@ -955,6 +968,9 @@ impl SessionsEngine {
                         tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed")
                     }
                 }
+                // The dispatch registered the run (Working) or failed out of
+                // it — either way the revival window is over.
+                lock(&sessions.inner.reviving).remove(&chat_id);
             });
         }
         Ok(recovered)

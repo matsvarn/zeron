@@ -1844,6 +1844,7 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
+                let mut undo = None;
                 if let Some(notify) = &p.notify {
                     // Arm BEFORE the command lands so a fast turn cannot
                     // settle before the engine knows a notice is owed.
@@ -1861,17 +1862,30 @@ impl RpcService for EngineRpc {
                                         .into(),
                                 )
                             })?;
-                    self.delegation
-                        .as_ref()
-                        .ok_or_else(|| RpcError::Failed("delegation engine not wired".into()))?
-                        .arm(&p.chat_id, &notify.batch, &message_id)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    undo = Some(
+                        self.delegation
+                            .as_ref()
+                            .ok_or_else(|| RpcError::Failed("delegation engine not wired".into()))?
+                            .arm(&p.chat_id, &notify.batch, &message_id)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    );
                 }
-                let command_id = self
+                match self
                     .doc_host
                     .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+                {
+                    Ok(command_id) => {
+                        RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+                    }
+                    Err(err) => {
+                        // The command never queued — the armed entry would
+                        // wait on a turn that never runs and block the batch.
+                        if let (Some(delegation), Some(undo)) = (self.delegation.as_ref(), undo) {
+                            delegation.disarm(&p.chat_id, undo);
+                        }
+                        return Err(RpcError::Failed(err.to_string()));
+                    }
+                }
             }
             methods::TAKE_PROJECT_ACTION_SETUP => {
                 let p: TakeProjectActionSetupParams = parse_params(params)?;
