@@ -193,6 +193,30 @@ impl RunJournal {
         Ok(stale)
     }
 
+    /// Quit-fence scan: chats whose journal's last event IS a terminal
+    /// `Done`, with its status. A graceful quit can write the `Done` while
+    /// losing the doc's entry stamp — those chats aren't `stale` (nothing to
+    /// revive), but their trailing assistant entry stays `streaming`.
+    pub fn done_sessions(&self) -> Result<Vec<(String, zeron_proto::DoneStatus)>, JournalError> {
+        let mut done = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(chat_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let last = read_lines(&path)?.into_iter().next_back();
+            if let Some((_, AgentEvent::Done { status, .. })) = last {
+                done.push((chat_id.to_string(), status));
+            }
+        }
+        done.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(done)
+    }
+
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);

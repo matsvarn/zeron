@@ -3820,3 +3820,54 @@ async fn a_boot_notice_run_carries_the_zeron_mcp_server() {
     );
     core.shutdown().await;
 }
+
+/// REGRESSION: a graceful quit writes Done{interrupted} to the journal but
+/// can lose the doc's entry stamp — the assistant entry stays Streaming and
+/// the chat reads idle/not-interrupted forever (live: task_status showed
+/// "idle" for a pi task whose notice said interrupted). Boot recovery must
+/// stamp the trailing Streaming entry from the journal's Done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quit_raced_streaming_entry_is_stamped_at_boot() {
+    use zeron_engine::RunJournal;
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    let device_id = core.device_id.clone();
+    core.shutdown().await;
+    drop(core);
+    // The quit shape: streaming entry survives, journal ends Done.
+    plant_crash(dir.path(), "task-1", &device_id, /* fresh = */ true);
+    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    journal
+        .append(
+            "task-1",
+            &AgentEvent::Done {
+                status: zeron_proto::DoneStatus::Interrupted,
+                result: None,
+                error: Some("This operation was aborted".into()),
+                session_id: None,
+            },
+        )
+        .unwrap();
+
+    let harness2 = Held::new(SteeringMode::StepBoundary);
+    let core2 = assemble_at(dir.path(), harness2.clone());
+    core2.sessions.set_ipc_port(27656);
+    wait_for(|| ledger(&core2).is_empty(), "the orphaned turn settles").await;
+    let notice = notices(&core2, "root");
+    assert_eq!(notice.len(), 1, "exactly one notice: {notice:?}");
+    assert!(notice[0].contains("interrupted"), "{}", notice[0]);
+    // The doc entry is stamped — not left Streaming.
+    let last = entries(&core2, "task-1")
+        .into_iter()
+        .rev()
+        .find(|e| e.role == MessageRole::Assistant)
+        .expect("the assistant entry");
+    assert_eq!(
+        last.status,
+        Some(MessageStatus::Aborted),
+        "streaming residue must be stamped at boot"
+    );
+    core2.shutdown().await;
+}

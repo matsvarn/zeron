@@ -1075,6 +1075,47 @@ impl SessionsEngine {
                 lock(&sessions.inner.reviving).remove(&chat_id);
             });
         }
+
+        // Quit-fence reconciliation: a graceful quit writes Done to the
+        // journal but the doc's entry stamp is not guaranteed to land (the
+        // process can exit mid-write). A trailing Streaming assistant entry
+        // on a done journal is residue — stamp it the way the run's Done
+        // would have, or transcripts read as still-running forever.
+        for (chat_id, status) in self.inner.journal.done_sessions()? {
+            if lock(&self.inner.runs).contains_key(&chat_id) {
+                continue; // a live run owns its own stamping
+            }
+            let Ok(handle) = self.doc_handle(&chat_id) else {
+                continue;
+            };
+            let status = match status {
+                DoneStatus::Interrupted => MessageStatus::Aborted,
+                _ => MessageStatus::Complete,
+            };
+            let stamped = handle
+                .doc()
+                .read_entries()
+                .ok()
+                .into_iter()
+                .flatten()
+                .rev()
+                .filter(|e| {
+                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Streaming)
+                })
+                .take(1)
+                .filter_map(|e| {
+                    handle
+                        .doc()
+                        .set_message_status(&e.id, status)
+                        .ok()
+                        .filter(|ok| *ok)
+                        .map(|_| e.id)
+                })
+                .collect::<Vec<_>>();
+            if !stamped.is_empty() {
+                tracing::info!(chat = %chat_id, entries = ?stamped, "stamped quit-raced streaming entry");
+            }
+        }
         Ok(recovered)
     }
 
