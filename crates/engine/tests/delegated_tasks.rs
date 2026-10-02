@@ -3053,3 +3053,105 @@ async fn a_process_end_while_waiting_for_the_wake_settles_interrupted() {
     );
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_armed_task_whose_turn_never_starts_settles_errored_after_the_grace() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    // Injectable grace (STALE_ARM_GRACE in production is 30 s).
+    core.delegation
+        .set_stale_arm_grace(Duration::from_millis(300));
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    // Arm without any QueueCommand — the queued run failed to start (the fd-
+    // exhaustion shape). Sealed like a single-call batch.
+    core.delegation.arm("task-1", "b1", "m-never").unwrap();
+    core.delegation.seal_batch("root", "b1").await;
+    wait_for(|| notices(&core, "root").len() == 1, "the errored notice").await;
+    let notice = &notices(&core, "root")[0];
+    assert!(notice.contains(": errored"), "{notice}");
+    assert!(
+        notice.contains("the command was not queued or failed to start"),
+        "{notice}"
+    );
+    assert!(harness.runs_for("task-1").is_empty(), "no turn ever ran");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_but_not_yet_delivered_message_is_not_stale() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    // Zero grace: any absent message would settle immediately if not queued.
+    core.delegation.set_stale_arm_grace(Duration::ZERO);
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    // Park the queue: an interrupt freezes it, so the next message waits as
+    // a queue row instead of starting a turn.
+    run_chat(&client, "task-1", "m-first", "job", Some("b0")).await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "first run").await;
+    queue_command(&client, "task-1", SessionCommandPayload::Interrupt {}, None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            core.sessions
+                .session_status("task-1")
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::Idle)
+        },
+        "the stopped task",
+    )
+    .await;
+    // Re-arm: the message lands as a QUEUED row, not a transcript entry.
+    run_chat(&client, "task-1", "m-queued", "more work", Some("b1")).await;
+    core.delegation.seal_batch("root", "b1").await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        notices(&core, "root")
+            .iter()
+            .all(|n| !n.contains("never started")),
+        "a queued message must not settle as never-started: {:?}",
+        notices(&core, "root")
+    );
+    // The re-arm keeps its original batch but tracks the queued message —
+    // it must stay armed (owed), not settle on the absent transcript entry.
+    let rows = client
+        .call(methods::LIST_DELEGATIONS, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        rows["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["chatId"] == "task-1" && t["notice"] == "armed"),
+        "the queued arm stays owed: {rows}"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_ledger_save_rolls_back_the_arm() {
+    let (_dir, core, _harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    core.delegation.fail_next_save();
+    let err = match core.delegation.arm("task-1", "b1", "m-x") {
+        Ok(_) => panic!("arm should fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("injected"), "{err}");
+    let rows = client
+        .call(methods::LIST_DELEGATIONS, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert!(
+        rows["tasks"].as_array().is_none_or(|t| t.is_empty()),
+        "nothing stays armed after a failed save: {rows}"
+    );
+    core.shutdown().await;
+}

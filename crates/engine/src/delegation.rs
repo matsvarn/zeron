@@ -63,11 +63,15 @@ impl Outcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settled {
     outcome: Outcome,
     at_ms: i64,
+    /// Verdict text when the transcript carries none (a turn that never
+    /// started has no assistant entry to quote).
+    #[serde(default)]
+    note: Option<String>,
 }
 
 /// One armed task. A task belongs to one batch at a time.
@@ -86,6 +90,10 @@ struct Armed {
     /// Last input request already reported by an attention notice.
     #[serde(default)]
     asked: Option<String>,
+    /// When the arm landed — the stale-arm grace counts from it. Older
+    /// ledger files lack it and read as long ago.
+    #[serde(default)]
+    armed_at_ms: i64,
     #[serde(default)]
     settled: Option<Settled>,
 }
@@ -115,6 +123,14 @@ struct Ledger {
 /// seals and releases it on its own.
 const AUTO_SEAL: Duration = Duration::from_secs(60);
 
+/// An armed task whose message never lands (the QueueCommand failed, e.g. fd
+/// exhaustion) settles `errored` after this grace — the gap between arm and
+/// the command's execution is normally milliseconds.
+const STALE_ARM_GRACE: Duration = Duration::from_secs(30);
+/// Result text for a turn that never started.
+const NEVER_STARTED: &str =
+    "The task's turn never started (the command was not queued or failed to start).";
+
 /// One armed task's outcome, or why it hasn't settled.
 enum IdleVerdict {
     Settled(Outcome),
@@ -123,6 +139,9 @@ enum IdleVerdict {
     TurnStarting,
     /// Still owed: message pending, queued next turn, or own tasks armed.
     Owed,
+    /// The armed message never made it into the transcript or the queue and
+    /// the grace has passed — the command failed to queue or start.
+    NeverStarted,
 }
 
 /// Undo token for [`DelegationEngine::arm`]: the entry's previous state, or
@@ -161,6 +180,10 @@ struct Inner {
     save_lock: Mutex<()>,
     /// Injectable auto-seal window for tests (`AUTO_SEAL` in production).
     auto_seal: Mutex<Duration>,
+    /// Injectable stale-arm grace for tests (`STALE_ARM_GRACE`).
+    stale_arm_grace: Mutex<Duration>,
+    /// Test hook: the next `save()` fails.
+    fail_next_save: AtomicBool,
     /// Serializes every settle path: worker pass, rechecks, boot, cancel.
     settle: tokio::sync::Mutex<()>,
     workspace: WorkspaceHost,
@@ -204,6 +227,8 @@ impl DelegationEngine {
                 scheduled: Mutex::new(HashMap::new()),
                 save_lock: Mutex::new(()),
                 auto_seal: Mutex::new(AUTO_SEAL),
+                stale_arm_grace: Mutex::new(STALE_ARM_GRACE),
+                fail_next_save: AtomicBool::new(false),
                 settle: tokio::sync::Mutex::new(()),
                 workspace,
                 doc_host,
@@ -228,7 +253,7 @@ impl DelegationEngine {
                 } else {
                     "armed"
                 },
-                outcome: t.settled.map(|s| s.outcome),
+                outcome: t.settled.as_ref().map(|s| s.outcome),
             })
             .collect()
     }
@@ -316,6 +341,7 @@ impl DelegationEngine {
                     let undo = ArmUndo(Some(task.clone()));
                     task.message_id = message_id.to_string();
                     task.settled = None;
+                    task.armed_at_ms = now_ms();
                     undo
                 }
                 None => {
@@ -325,12 +351,14 @@ impl DelegationEngine {
                         batch: batch.to_string(),
                         message_id: message_id.to_string(),
                         asked: None,
+                        armed_at_ms: now_ms(),
                         settled: None,
                     });
                     ArmUndo(None)
                 }
             }
         };
+        let mut created_seal = false;
         {
             let mut ledger = lock(&self.inner.ledger);
             if !ledger
@@ -344,9 +372,29 @@ impl DelegationEngine {
                     sealed: false,
                     first_armed_at_ms: now_ms(),
                 });
+                created_seal = true;
             }
         }
-        self.save()?;
+        // A failed save must not leave the armed entry in memory: the caller
+        // sees the error and drops it, but the settle watcher would still
+        // evaluate a phantom arm every pass and block the batch forever.
+        if let Err(err) = self.save() {
+            let mut ledger = lock(&self.inner.ledger);
+            match undo.0 {
+                None => ledger.tasks.retain(|t| t.chat_id != chat_id),
+                Some(previous) => {
+                    if let Some(task) = ledger.tasks.iter_mut().find(|t| t.chat_id == chat_id) {
+                        *task = previous;
+                    }
+                }
+            }
+            if created_seal {
+                ledger
+                    .seals
+                    .retain(|seal| !(seal.delegator == delegation.by && seal.batch == batch));
+            }
+            return Err(err);
+        }
         Ok(undo)
     }
 
@@ -607,9 +655,13 @@ impl DelegationEngine {
         match status {
             SessionStatus::Working => {}
             SessionStatus::AwaitingInput => self.report_pending_input(&task).await,
-            SessionStatus::Errored => self.settle(&task, Outcome::Errored).await,
+            SessionStatus::Errored => self.settle(&task, Outcome::Errored, None).await,
             SessionStatus::Idle => match self.idle_outcome(&task) {
-                IdleVerdict::Settled(outcome) => self.settle(&task, outcome).await,
+                IdleVerdict::Settled(outcome) => self.settle(&task, outcome, None).await,
+                IdleVerdict::NeverStarted => {
+                    self.settle(&task, Outcome::Errored, Some(NEVER_STARTED))
+                        .await
+                }
                 IdleVerdict::TurnStarting => self.reevaluate_later(&task.chat_id),
                 IdleVerdict::Owed => {}
             },
@@ -675,13 +727,20 @@ impl DelegationEngine {
                     return;
                 }
                 match engine.idle_outcome(&task) {
+                    IdleVerdict::NeverStarted => {
+                        engine
+                            .settle(&task, Outcome::Errored, Some(NEVER_STARTED))
+                            .await;
+                        lock(&engine.inner.scheduled).remove(&chat_id);
+                        return;
+                    }
                     IdleVerdict::TurnStarting => continue,
                     IdleVerdict::Owed => {
                         lock(&engine.inner.scheduled).remove(&chat_id);
                         return;
                     }
                     IdleVerdict::Settled(outcome) => {
-                        engine.settle(&task, outcome).await;
+                        engine.settle(&task, outcome, None).await;
                         lock(&engine.inner.scheduled).remove(&chat_id);
                         return;
                     }
@@ -708,9 +767,11 @@ impl DelegationEngine {
                 batch: batch.into(),
                 message_id: message_id.into(),
                 asked: None,
+                armed_at_ms: 0,
                 settled: None,
             },
             outcome,
+            None,
         )
         .await;
     }
@@ -726,10 +787,38 @@ impl DelegationEngine {
             return IdleVerdict::Owed;
         };
         // A held message becomes a user entry under its queued id only when
-        // sent; a turn ending before that is an EARLIER turn.
+        // sent; a turn ending before that is an EARLIER turn. A message that
+        // never lands at all means the command failed to queue or start —
+        // owed through the grace, then errored so the batch can release.
         let after = match entries.iter().position(|e| e.id == task.message_id) {
             Some(pos) => &entries[pos..],
-            None => return IdleVerdict::Owed,
+            None => {
+                let queued = handle
+                    .doc()
+                    .read_queue()
+                    .map(|queue| queue.iter().any(|row| row.id == task.message_id))
+                    .unwrap_or(true);
+                let pending_commands = handle
+                    .doc()
+                    .read_commands()
+                    .map(|commands| {
+                        commands
+                            .iter()
+                            .any(|c| c.status == zeron_doc::SessionCommandStatus::Pending)
+                    })
+                    .unwrap_or(true);
+                if pending_commands {
+                    return IdleVerdict::TurnStarting;
+                }
+                if queued || self.inner.sessions.is_reviving(&task.chat_id) {
+                    return IdleVerdict::Owed;
+                }
+                let grace = *lock(&self.inner.stale_arm_grace);
+                if now_ms() - task.armed_at_ms >= grace.as_millis() as i64 {
+                    return IdleVerdict::NeverStarted;
+                }
+                return IdleVerdict::Owed;
+            }
         };
         // Between the armed message landing and the run registering there is
         // an Idle window: the command driving the turn is still pending. A
@@ -799,7 +888,7 @@ impl DelegationEngine {
         }
     }
 
-    async fn settle(&self, task: &Armed, outcome: Outcome) {
+    async fn settle(&self, task: &Armed, outcome: Outcome, note: Option<&str>) {
         {
             let mut ledger = lock(&self.inner.ledger);
             // The verdict belongs to the armed message's turn: a re-arm with
@@ -810,6 +899,7 @@ impl DelegationEngine {
                 entry.settled = Some(Settled {
                     outcome,
                     at_ms: now_ms(),
+                    note: note.map(str::to_owned),
                 });
             }
         }
@@ -989,6 +1079,7 @@ impl DelegationEngine {
                     harness: harness_label(row.as_ref()),
                     outcome: task
                         .settled
+                        .as_ref()
                         .map(|s| s.outcome)
                         .unwrap_or(Outcome::Completed),
                     text: task_result_text(self.inner.doc_host.open(&task.chat_id).ok(), task),
@@ -1002,8 +1093,23 @@ impl DelegationEngine {
     /// Callers on different paths (arm on the RPC path, settle on the
     /// watcher) race, so serialize + rename happens under `save_lock` and the
     /// last writer always holds the newest state.
+    /// `auto_seal` override for tests.
+    #[doc(hidden)]
+    pub fn set_stale_arm_grace(&self, grace: Duration) {
+        *lock(&self.inner.stale_arm_grace) = grace;
+    }
+
+    /// Test hook: fail the next ledger save (arm rollback coverage).
+    #[doc(hidden)]
+    pub fn fail_next_save(&self) {
+        self.inner.fail_next_save.store(true, Ordering::Release);
+    }
+
     fn save(&self) -> Result<(), EngineError> {
         let _save = lock(&self.inner.save_lock);
+        if self.inner.fail_next_save.swap(false, Ordering::AcqRel) {
+            return Err(EngineError::Other("injected ledger save failure".into()));
+        }
         let bytes = {
             let ledger = lock(&self.inner.ledger);
             serde_json::to_vec(&*ledger).map_err(|e| EngineError::Other(e.to_string()))?
@@ -1036,6 +1142,9 @@ impl DelegationEngine {
 /// interrupted task with no new assistant entry reports nothing from an
 /// earlier turn.
 fn task_result_text(handle: Option<Arc<crate::doc_host::ChatDocHandle>>, task: &Armed) -> String {
+    if let Some(note) = task.settled.as_ref().and_then(|s| s.note.clone()) {
+        return note;
+    }
     let Some(handle) = handle else {
         return String::new();
     };
@@ -1046,6 +1155,7 @@ fn task_result_text(handle: Option<Arc<crate::doc_host::ChatDocHandle>>, task: &
     };
     let outcome = task
         .settled
+        .as_ref()
         .map(|s| s.outcome)
         .unwrap_or(Outcome::Completed);
     let texts = |entry: &zeron_doc::SessionMessageEntry| {
