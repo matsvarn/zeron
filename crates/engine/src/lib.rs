@@ -1159,7 +1159,6 @@ async fn run_org_onboarding(auth: Auth) {
     }
 }
 
-/// Best-effort human name for this device's registry row.
 /// RLIMIT_NOFILE target: macOS setrlimit rejects values above OPEN_MAX
 /// (10240), so clamp there; a higher existing soft limit is never lowered.
 #[cfg(unix)]
@@ -1205,6 +1204,7 @@ fn raise_fd_limit() {
 #[cfg(not(unix))]
 fn raise_fd_limit() {}
 
+/// Best-effort human name for this device's registry row.
 fn local_device_name(device_id: &str) -> String {
     select_local_device_name(
         [
