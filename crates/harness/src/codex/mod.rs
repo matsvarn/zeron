@@ -1521,15 +1521,12 @@ async fn run_session(session: Session) {
                 Some(Incoming::Eof) | None => break 'main,
             },
 
-            answer = answer_rx.next(), if !interrupted => match answer {
-                Some(text) => {
-                    if !deliver_user_text(
-                        &client, text, &thread_id, &mut router,
-                        &mut queued_steers, &event_tx, &mut assistant_message_id,
-                        &mut done_current, &mut current_native, &turn_params,
-                    ).await { break 'main; }
-                }
-                None => {}
+            answer = answer_rx.next(), if !interrupted => {
+                if let Some(text) = answer && !deliver_user_text(
+                    &client, text, &thread_id, &mut router,
+                    &mut queued_steers, &event_tx, &mut assistant_message_id,
+                    &mut done_current, &mut current_native, &turn_params,
+                ).await { break 'main; }
             },
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
@@ -1633,6 +1630,7 @@ async fn run_session(session: Session) {
 /// into the active turn via `turn/steer`, or — when the race is lost or no
 /// turn is active — queue it for (or start as) the next `turn/start` on the
 /// same thread. Returns false when the event channel is gone.
+#[allow(clippy::too_many_arguments)] // run-loop state, not a public API
 async fn deliver_user_text(
     client: &RpcClient,
     text: String,
@@ -1762,6 +1760,9 @@ fn async_answer_text(questions: &[UserInputQuestion], answers: &[UserInputAnswer
         .join("\n")
 }
 
+/// Deliver a steer as a fresh `turn/start` on the same thread (the fallback
+/// leg of the steer race, and the between-turns delivery path). Returns false
+/// when the loop should end (turn/start failed or the consumer hung up).
 async fn steer_as_new_turn(
     client: &RpcClient,
     params: Value,

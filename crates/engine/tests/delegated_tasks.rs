@@ -3358,3 +3358,39 @@ async fn a_progress_notice_marks_a_waiting_member_as_needing_input() {
     assert!(progress.contains("needs input"), "{progress}");
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fully_delivered_batch_releases_when_its_last_member_is_cancelled() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    core.delegation.set_batch_progress_window(Duration::ZERO);
+    root(&core, "root");
+    delegate_run_unsealed(&client, &core, "root", "task-1", "b1", "job").await;
+    delegate_run_unsealed(&client, &core, "root", "task-2", "b1", "job").await;
+    core.delegation.seal_batch("root", "b1").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task-1 run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(
+        || {
+            notices(&core, "root")
+                .iter()
+                .any(|n| n.contains("RESULT-1"))
+        },
+        "the progress notice",
+    )
+    .await;
+    // task-1 settled+delivered, task-2 still working. Cancelling task-2 must
+    // release the batch: nothing undelivered remains, but the ledger row and
+    // seal still have to go.
+    client
+        .call(
+            methods::CANCEL_DELEGATED_TASK,
+            serde_json::json!({ "chatId": "task-2" }),
+        )
+        .await
+        .unwrap();
+    wait_for(|| ledger(&core).is_empty(), "the batch to clear").await;
+    let count = notices(&core, "root").len();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(notices(&core, "root").len(), count, "no further notice");
+    core.shutdown().await;
+}

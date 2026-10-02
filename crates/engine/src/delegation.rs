@@ -954,16 +954,15 @@ impl DelegationEngine {
             }
             members
         };
-        // Members a progress notice already carried are not repeated.
+        // Members a progress notice already carried are not repeated. Every
+        // member delivered (progress covered them all) skips only the notice —
+        // the ledger cleanup and delegator re-evaluation below still run.
         let members: Vec<Armed> = members
             .into_iter()
             .filter(|t| t.delivered.is_none())
             .collect();
-        if members.is_empty() {
-            return;
-        }
         let notice_id = format!("notice-{batch}");
-        if !self.notice_present(delegator, &notice_id) {
+        if !members.is_empty() && !self.notice_present(delegator, &notice_id) {
             let text = self.build_notice(&notice_id, &members);
             if let Err(err) = self
                 .inner
@@ -1273,10 +1272,6 @@ impl DelegationEngine {
         settle_notice_text(notice_id, &tasks)
     }
 
-    /// Atomic ledger write: temp file + rename, like the device-id file.
-    /// Callers on different paths (arm on the RPC path, settle on the
-    /// watcher) race, so serialize + rename happens under `save_lock` and the
-    /// last writer always holds the newest state.
     /// `BATCH_PROGRESS_AFTER` override for tests.
     #[doc(hidden)]
     pub fn set_batch_progress_window(&self, window: Duration) {
@@ -1295,6 +1290,10 @@ impl DelegationEngine {
         self.inner.fail_next_save.store(true, Ordering::Release);
     }
 
+    /// Atomic ledger write: temp file + rename, like the device-id file.
+    /// Callers on different paths (arm on the RPC path, settle on the
+    /// watcher) race, so serialize + rename happens under `save_lock` and the
+    /// last writer always holds the newest state.
     fn save(&self) -> Result<(), EngineError> {
         let _save = lock(&self.inner.save_lock);
         if self.inner.fail_next_save.swap(false, Ordering::AcqRel) {
