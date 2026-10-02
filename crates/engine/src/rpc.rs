@@ -1887,6 +1887,28 @@ impl RpcService for EngineRpc {
                     }
                 }
             }
+            methods::CANCEL_DELEGATED_TASK => {
+                let p: ChatParams = parse_params(params)?;
+                let result = self
+                    .delegation
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("delegation engine not wired".into()))?
+                    .cancel(&p.chat_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&result)
+            }
+            methods::LIST_DELEGATIONS => {
+                let tasks = self
+                    .delegation
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("delegation engine not wired".into()))?
+                    .list();
+                RpcReply::value(
+                    &serde_json::to_value(serde_json::json!({ "tasks": tasks }))
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
             methods::TAKE_PROJECT_ACTION_SETUP => {
                 let p: TakeProjectActionSetupParams = parse_params(params)?;
                 let outcome = self

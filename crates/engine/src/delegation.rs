@@ -308,6 +308,114 @@ impl DelegationEngine {
         }
     }
 
+    /// `CancelDelegatedTask`: the task and every chat below it, removed from
+    /// the ledger in one step BEFORE any interrupt lands — an interrupted
+    /// grandchild must not wake a cancelled parent. Then the in-flight turns
+    /// stop, target first. Returns the `task_cancel` result body.
+    pub async fn cancel(&self, chat_id: &str) -> Result<serde_json::Value, EngineError> {
+        let _settle = self.inner.settle.lock().await;
+        // The subtree follows `delegation.by` (not `parentChatId`, which is
+        // always the root).
+        let chats = self.inner.workspace.watch_chats().borrow().clone();
+        let mut subtree = vec![chat_id.to_string()];
+        let mut frontier = vec![chat_id.to_string()];
+        while let Some(parent) = frontier.pop() {
+            for child in chats
+                .iter()
+                .filter(|c| c.delegation.as_ref().is_some_and(|d| d.by == parent))
+            {
+                subtree.push(child.id.clone());
+                frontier.push(child.id.clone());
+            }
+        }
+        let target_delegator = self
+            .inner
+            .workspace
+            .chat(chat_id)?
+            .and_then(|c| c.delegation.map(|d| d.by));
+        {
+            let mut ledger = lock(&self.inner.ledger);
+            ledger.tasks.retain(|t| !subtree.contains(&t.chat_id));
+        }
+        if let Err(err) = self.save() {
+            tracing::warn!(error = %err, "delegation ledger write failed");
+        }
+        let mut interrupted = Vec::new();
+        let mut not_running = Vec::new();
+        for id in &subtree {
+            let title = self
+                .inner
+                .workspace
+                .chat(id)?
+                .and_then(|c| c.title)
+                .unwrap_or_default();
+            let was = self.inner.sessions.session_status(id).map(|s| s.status);
+            let stop = self.inner.doc_host.interrupt_and_pause(id).await?;
+            if stop {
+                interrupted.push(serde_json::json!({
+                    "chatId": id,
+                    "title": title,
+                    "wasState": state_label(was),
+                }));
+            } else {
+                not_running.push(serde_json::json!({
+                    "chatId": id,
+                    "title": title,
+                    "state": self.row_state(id),
+                }));
+            }
+        }
+        // The delegator may be an armed task that was waiting on this subtree.
+        if let Some(delegator) = target_delegator
+            && lock(&self.inner.ledger)
+                .tasks
+                .iter()
+                .any(|t| t.chat_id == delegator)
+        {
+            self.evaluate(&delegator).await;
+        }
+        Ok(serde_json::json!({
+            "chatId": chat_id,
+            "interrupted": interrupted,
+            "notRunning": not_running,
+        }))
+    }
+
+    /// A task's `task_status`-style state for the cancel reply.
+    fn row_state(&self, chat_id: &str) -> &'static str {
+        match self
+            .inner
+            .sessions
+            .session_status(chat_id)
+            .map(|s| s.status)
+        {
+            Some(SessionStatus::Working) => "working",
+            Some(SessionStatus::AwaitingInput) => "awaitingInput",
+            Some(SessionStatus::Errored) => "errored",
+            _ => {
+                let idle = self
+                    .inner
+                    .doc_host
+                    .open(chat_id)
+                    .ok()
+                    .and_then(|h| h.doc().read_entries().ok())
+                    .and_then(|entries| {
+                        entries
+                            .iter()
+                            .rev()
+                            .find(|e| e.role == MessageRole::Assistant)
+                            .map(|e| e.status)
+                    })
+                    .flatten();
+                match idle {
+                    Some(MessageStatus::Complete) => "completed",
+                    Some(MessageStatus::Aborted) => "interrupted",
+                    _ => "idle",
+                }
+            }
+        }
+    }
+
     /// One serialized pass over the ledger: evaluate every armed task, then
     /// release every settled batch (covers deliveries that failed earlier —
     /// each tick retries them for free).
@@ -838,6 +946,15 @@ fn harness_label(row: Option<&Chat>) -> String {
         .and_then(|c| serde_json::to_value(c.harness).ok())
         .and_then(|v| v.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into())
+}
+
+fn state_label(status: Option<SessionStatus>) -> &'static str {
+    match status {
+        Some(SessionStatus::Working) => "working",
+        Some(SessionStatus::AwaitingInput) => "awaitingInput",
+        Some(SessionStatus::Errored) => "errored",
+        _ => "idle",
+    }
 }
 
 /// Eight hex chars derived from the notice id. If the candidate tag occurs in

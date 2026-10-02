@@ -2048,3 +2048,441 @@ async fn an_unreadable_ledger_is_moved_aside() {
     assert_eq!(ledger(&core).len(), 1);
     core.shutdown().await;
 }
+
+// ── cancel ──────────────────────────────────────────────────────────────────
+
+async fn cancel(client: &RpcClient, chat: &str) -> serde_json::Value {
+    client
+        .call_as::<serde_json::Value>(
+            methods::CANCEL_DELEGATED_TASK,
+            serde_json::json!({ "chatId": chat }),
+        )
+        .await
+        .expect("cancel")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_stops_the_subtree_and_sends_nothing() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-p", "b-p", "outer").await;
+    wait_for(|| !harness.runs_for("task-p").is_empty(), "P run").await;
+    delegate_run(&client, &core, "task-p", "task-g", "b-g", "inner").await;
+    wait_for(|| !harness.runs_for("task-g").is_empty(), "G run").await;
+
+    let result = cancel(&client, "task-p").await;
+    let interrupted = result["interrupted"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no interrupted list in {result}"));
+    let ids: Vec<_> = interrupted
+        .iter()
+        .map(|t| t["chatId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["task-p", "task-g"], "target first, then children");
+    assert_eq!(interrupted[0]["wasState"].as_str().unwrap(), "working");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(ledger(&core).is_empty(), "the whole subtree is disarmed");
+    assert!(notices(&core, "root").is_empty(), "nothing reports");
+    let task_p = entries(&core, "task-p");
+    // A turn killed before any streamed output may leave no assistant entry
+    // at all; if one exists it must be stamped Aborted, never Completed.
+    let last_assistant = task_p
+        .iter()
+        .rev()
+        .find(|e| e.role == MessageRole::Assistant);
+    assert!(
+        last_assistant.is_none_or(|e| e.status == Some(MessageStatus::Aborted)),
+        "unexpected last entry: {last_assistant:?}"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_leaves_finished_tasks_readable() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-p", "b-p", "outer").await;
+    wait_for(|| !harness.runs_for("task-p").is_empty(), "P run").await;
+    delegate_run(&client, &core, "task-p", "task-g", "b-g", "inner").await;
+    wait_for(|| !harness.runs_for("task-g").is_empty(), "G run").await;
+    harness.finish("task-g", Finish::Complete("G-DONE".into()));
+    wait_for(
+        || !notices(&core, "task-p").is_empty() || harness.runs_for("task-p").len() == 2,
+        "G's notice to reach P",
+    )
+    .await;
+
+    let result = cancel(&client, "task-p").await;
+    let not_running = result["notRunning"].as_array().unwrap();
+    let g = not_running
+        .iter()
+        .find(|t| t["chatId"] == "task-g")
+        .expect("finished child listed as notRunning");
+    assert_eq!(g["state"].as_str().unwrap(), "completed");
+    assert!(
+        entries(&core, "task-g")
+            .iter()
+            .any(|e| { e.role == MessageRole::Assistant && entry_text(e).contains("G-DONE") })
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_does_not_touch_sibling_tasks() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-a", "b1", "job a").await;
+    delegate_run(&client, &core, "root", "task-b", "b2", "job b").await;
+    wait_for(
+        || !harness.runs_for("task-a").is_empty() && !harness.runs_for("task-b").is_empty(),
+        "both runs",
+    )
+    .await;
+
+    cancel(&client, "task-a").await;
+    assert_eq!(ledger(&core).len(), 1, "only the sibling stays armed");
+
+    harness.finish("task-b", Finish::Complete("B-RESULT".into()));
+    wait_for(|| notices(&core, "root").len() == 1, "B's notice").await;
+    assert!(notices(&core, "root")[0].contains("B-RESULT"));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_freezes_the_cancelled_queues() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-p", "b-p", "outer").await;
+    wait_for(|| !harness.runs_for("task-p").is_empty(), "P run").await;
+    // A follow-up queued behind the live turn.
+    core.doc_host
+        .queue_message("task-p", "held row", Vec::new())
+        .unwrap();
+    wait_for(|| !queue_rows(&core, "task-p").is_empty(), "the held row").await;
+
+    cancel(&client, "task-p").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rows = queue_rows(&core, "task-p");
+    assert_eq!(rows.len(), 1, "the queued row survives the interrupt");
+    assert_eq!(rows[0].text, "held row");
+    assert_eq!(harness.runs_for("task-p").len(), 1, "no new turn");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_the_last_outstanding_task_lets_the_delegator_task_settle() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-p", "b-p", "outer").await;
+    wait_for(|| !harness.runs_for("task-p").is_empty(), "P run").await;
+    delegate_run(&client, &core, "task-p", "task-g", "b-g", "inner").await;
+    wait_for(|| !harness.runs_for("task-g").is_empty(), "G run").await;
+
+    // P completes its turn while G is outstanding: P stays armed, no notice.
+    harness.finish("task-p", Finish::Complete("P-RESULT".into()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(notices(&core, "root").is_empty());
+
+    // Cancelling the last outstanding task unblocks P's settle.
+    cancel(&client, "task-g").await;
+    wait_for(|| notices(&core, "root").len() == 1, "P's notice").await;
+    assert!(notices(&core, "root")[0].contains("P-RESULT"));
+    assert!(ledger(&core).is_empty());
+    core.shutdown().await;
+}
+
+// ── restart durability ──────────────────────────────────────────────────────
+
+fn write_ledger(dir: &std::path::Path, tasks: serde_json::Value) {
+    let root = dir.join("orgs/dev-org/dev-user");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("delegations.json"),
+        serde_json::to_vec(&serde_json::json!({ "tasks": tasks })).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_armed_task_survives_a_clean_restart() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    // Whether or not the notice beat the shutdown, the restart must leave
+    // the delegator with exactly one copy.
+    core.shutdown().await;
+    drop(core);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    core.sessions.set_ipc_port(27655);
+    wait_for(
+        || notices(&core, "root").len() == 1 && ledger(&core).is_empty(),
+        "the notice to arrive after restart (once)",
+    )
+    .await;
+    assert!(notices(&core, "root")[0].contains("RESULT-1"));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_batch_is_delivered_once_after_a_crash_before_delivery() {
+    // Engine 1: real rows + a finished task turn. Then die between the settle
+    // and the release by handing the boot pass a ledger marked settled.
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    core.delegation.shutdown().await; // freeze the watcher: no live settle
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        notices(&core, "root").is_empty(),
+        "pre-crash notices: {:?}",
+        notices(&core, "root")
+    );
+    // The settle landed in memory + file, but nothing released: rewrite the
+    // file as the crash would have left it (settled, unreleased).
+    write_ledger(
+        dir.path(),
+        serde_json::json!([{
+            "chatId": "task-1",
+            "delegator": "root",
+            "batch": "b1",
+            "messageId": "m-task-1",
+            "settled": { "outcome": "completed", "atMs": 1 },
+        }]),
+    );
+    core.shutdown().await;
+    drop(core);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    core.sessions.set_ipc_port(27655);
+    wait_for(|| notices(&core, "root").len() == 1, "boot pass delivers").await;
+    assert!(notices(&core, "root")[0].contains("RESULT-1"));
+    wait_for(|| ledger(&core).is_empty(), "the batch to release").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(notices(&core, "root").len(), 1, "delivered once");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivered_notice_is_not_sent_again_after_a_crash_before_the_ledger_write() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(|| notices(&core, "root").len() == 1, "the notice").await;
+    // Crash between delivery and the ledger write: the file still lists the
+    // settled task, the transcript already holds notice-b1.
+    write_ledger(
+        dir.path(),
+        serde_json::json!([{
+            "chatId": "task-1",
+            "delegator": "root",
+            "batch": "b1",
+            "messageId": "m-task-1",
+            "settled": { "outcome": "completed", "atMs": 1 },
+        }]),
+    );
+    core.shutdown().await;
+    drop(core);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    core.sessions.set_ipc_port(27655);
+    wait_for(|| ledger(&core).is_empty(), "the batch releases at boot").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        notices(&core, "root").len(),
+        1,
+        "the notice is not sent again"
+    );
+    assert_eq!(harness.runs_for("root").len(), 0, "no second run on root");
+    core.shutdown().await;
+}
+
+/// Manufacture the on-disk shape a kill -9 mid-turn leaves, on top of a
+/// gracefully-shutdown engine's real state: a Streaming assistant entry back
+/// in the chat doc snapshot and a journal whose last event is not Done.
+/// `fresh = false` makes the streaming entry older than the resume window.
+fn plant_crash(dir: &std::path::Path, chat: &str, device_id: &str, fresh: bool) {
+    use zeron_doc::SessionDoc;
+    use zeron_engine::RunJournal;
+    use zeron_sync::DocsStore;
+
+    let store_root = dir.join("orgs/dev-org/dev-user");
+    let store = DocsStore::open(&store_root).unwrap();
+    let bytes = store.load_snapshot(chat).unwrap().expect("chat snapshot");
+    let loro = loro::LoroDoc::new();
+    loro.import(&bytes).unwrap();
+    let doc = SessionDoc::from_doc(loro);
+    doc.push_message(&SessionMessageEntry {
+        duration_ms: None,
+        id: format!("a-{chat}-crash"),
+        role: MessageRole::Assistant,
+        parts: vec![MessagePart::Text {
+            id: "crash-text".into(),
+            text: "partial…".into(),
+        }],
+        created_at: if fresh {
+            crate_time_now()
+        } else {
+            crate_time_now() - 13 * 60 * 60 * 1000
+        },
+        device_id: device_id.into(),
+        status: Some(MessageStatus::Streaming),
+        continuation_of: None,
+    })
+    .unwrap();
+    store
+        .save_snapshot(chat, &doc.export_snapshot().unwrap())
+        .unwrap();
+    let journal = RunJournal::open(store_root.join("journals")).unwrap();
+    journal
+        .append(
+            chat,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: format!("sess-{chat}-crash"),
+                assistant_message_id: format!("a-{chat}-crash"),
+            },
+        )
+        .unwrap();
+}
+
+fn crate_time_now() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crashed_task_that_is_not_revived_settles_as_interrupted_at_boot() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(
+        &client,
+        &core.device_id,
+        "root",
+        "task-1",
+        Some("workspace-write"),
+    )
+    .await
+    .unwrap();
+    core.workspace.rename_chat("task-1", "task-1").unwrap();
+    run_chat(&client, "task-1", "m-task-1", "job", Some("b1")).await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    let device_id = core.device_id.clone();
+    core.shutdown().await;
+    drop(core);
+    // Now the "crash": a fresh Streaming entry and an open-ended journal.
+    plant_crash(dir.path(), "task-1", &device_id, /* fresh = */ false);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    core.sessions.set_ipc_port(27655);
+    wait_for(|| notices(&core, "root").len() == 1, "the boot settle").await;
+    assert!(
+        notices(&core, "root")[0].contains(": interrupted"),
+        "got: {}",
+        notices(&core, "root")[0]
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crashed_task_that_is_revived_stays_armed() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(
+        &client,
+        &core.device_id,
+        "root",
+        "task-1",
+        Some("workspace-write"),
+    )
+    .await
+    .unwrap();
+    core.workspace.rename_chat("task-1", "task-1").unwrap();
+    run_chat(&client, "task-1", "m-task-1", "job", Some("b1")).await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    let device_id = core.device_id.clone();
+    core.shutdown().await;
+    drop(core);
+    plant_crash(dir.path(), "task-1", &device_id, /* fresh = */ true);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    core.sessions.set_ipc_port(27655);
+    // The revived run re-dispatches during assemble — before the IPC port is
+    // set, so request.mcp is empty and the stub records it under "".
+    wait_for(
+        || !harness.runs.lock().unwrap().is_empty(),
+        "the revived run",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(notices(&core, "root").is_empty());
+    assert_eq!(ledger(&core).len(), 1);
+
+    let revived = harness.runs.lock().unwrap()[0].0.clone();
+    harness.finish(&revived, Finish::Complete("REVIVED-RESULT".into()));
+    wait_for(|| notices(&core, "root").len() == 1, "the notice").await;
+    assert!(notices(&core, "root")[0].contains("REVIVED-RESULT"));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_notice_waiting_in_a_queue_comes_back_frozen() {
+    let (dir, core, harness, client) = setup(SteeringMode::TurnBoundary).await;
+    root(&core, "root");
+    run_chat(&client, "root", "m-root", "work", None).await;
+    wait_for(|| !harness.runs_for("root").is_empty(), "root run").await;
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(
+        || {
+            queue_rows(&core, "root")
+                .iter()
+                .any(|r| r.id == "notice-b1")
+        },
+        "the notice to queue behind the busy turn",
+    )
+    .await;
+    core.shutdown().await;
+    drop(core);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    core.sessions.set_ipc_port(27655);
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    wait_for(
+        || {
+            queue_rows(&core, "root")
+                .iter()
+                .any(|r| r.id == "notice-b1")
+        },
+        "the row to still be queued after restart",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        harness.runs_for("root").is_empty(),
+        "no spontaneous run: the reopened queue stays frozen"
+    );
+    run_chat(&client, "root", "m-root-2", "back", None).await;
+    wait_for(
+        || !harness.runs_for("root").is_empty(),
+        "the user's turn to start",
+    )
+    .await;
+    core.shutdown().await;
+}
