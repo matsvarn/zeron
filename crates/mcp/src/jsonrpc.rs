@@ -65,7 +65,9 @@ turn. If a notice says that a task is waiting for input, answer it with \
 `respond_to_input`.\n\
 \n\
 If you are a delegated task, the final message of your turn is the result \
-your delegator receives, so make it complete. If you delegate further, Zeron \
+your delegator receives, and the task counts as finished when your turn ends. \
+Finish all work first, including commands you started in the background, and \
+make that message complete. If you delegate further, Zeron \
 holds your result back until your own tasks have settled and you have handled \
 their results. Delegation depth is limited, and a task you create cannot have \
 a higher sandbox level than yours.";
