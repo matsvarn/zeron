@@ -1055,10 +1055,18 @@ impl DelegationEngine {
                         .iter()
                         .any(|m| m.chat_id == t.chat_id && m.message_id == t.message_id))
             });
-            // The batch is gone — so is its seal.
-            ledger
-                .seals
-                .retain(|seal| !(seal.delegator == delegator && seal.batch == batch));
+            // The seal goes only when the batch is gone: a member re-armed
+            // during the delivery await keeps this batch, and a seal that
+            // already sealed still releases it on its own settle.
+            if !ledger
+                .tasks
+                .iter()
+                .any(|t| t.delegator == delegator && t.batch == batch)
+            {
+                ledger
+                    .seals
+                    .retain(|seal| !(seal.delegator == delegator && seal.batch == batch));
+            }
         }
         if let Err(err) = self.save() {
             tracing::warn!(error = %err, "delegation ledger write failed");
