@@ -530,6 +530,11 @@ enum MutateParams {
         /// on the row as `parentChatId` for orchestration trees.
         #[serde(default)]
         parent_chat_id: Option<String>,
+        /// Marks the row as a delegated task: the engine resolves the
+        /// delegator, derives `delegation.depth` and the root `parentChatId`,
+        /// and applies the depth and sandbox caps.
+        #[serde(default)]
+        delegated_by: Option<String>,
     },
     /// Create a space (device + folder pair). Idempotent by id; a live
     /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
@@ -1099,6 +1104,7 @@ impl EngineRpc {
                 branch,
                 cwd,
                 parent_chat_id,
+                delegated_by,
             } => {
                 self.workspace
                     .create_chat_with_parent(
@@ -1108,6 +1114,7 @@ impl EngineRpc {
                         config,
                         cwd,
                         parent_chat_id,
+                        delegated_by,
                     )
                     .map_err(failed)?;
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
@@ -1916,6 +1923,7 @@ impl RpcService for EngineRpc {
                 chat.last_seen_at = None;
                 chat.harness_session_id = None;
                 chat.harness_session_cwd = None;
+                chat.delegation = None;
                 chat.room_gen = Some(2);
                 // Missing rows open on chat2. Persist history before publishing
                 // the registry row so a crash cannot leave a discoverable empty fork.

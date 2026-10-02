@@ -232,6 +232,20 @@ pub struct Chat {
     /// deleted) is tolerated rather than cascaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
+    /// Set when another chat's agent created this chat through the Zeron MCP
+    /// server. Absent on user chats and on forks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation: Option<Delegation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Delegation {
+    /// The chat whose agent delegated this task. Notices go here.
+    pub by: String,
+    /// 1 for a task delegated by a top-level chat, 2 for a task delegated by
+    /// that task, and so on.
+    pub depth: u8,
 }
 
 impl Chat {

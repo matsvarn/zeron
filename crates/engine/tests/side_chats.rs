@@ -462,6 +462,7 @@ async fn native_commands_and_empty_side_chats_skip_the_history_wrapper() {
                 None,
                 Some("/tmp".into()),
                 parent.map(str::to_owned),
+                None,
             )
             .unwrap();
     }
