@@ -7688,16 +7688,28 @@ fn agent_message_display(text: &str) -> String {
     let Some((header, body)) = rest.split_once("]\n\n") else {
         return text.to_owned();
     };
-    let Some((label, id)) =
+    // Two wire variants: plain agent messages end ". Reply to it with the
+    // Zeron `send_message` tool, chat <id>."; notify-armed ones end " (<id>).
+    // Zeron delivers the final message of your turn to that chat
+    // automatically — do not reply with send_message."
+    if let Some((label, id)) =
         header.rsplit_once(". Reply to it with the Zeron `send_message` tool, chat ")
-    else {
+    {
+        let Some(id) = id.strip_suffix('.') else {
+            return text.to_owned();
+        };
+        let name = label.strip_suffix(&format!(" ({id})")).unwrap_or(label);
+        return format!("Message from {name}\n\n{body}");
+    }
+    let Some(label) = header.strip_suffix(
+        ". Zeron delivers the final message of your turn to that chat automatically — do not reply with send_message.",
+    ) else {
         return text.to_owned();
     };
-    let Some(id) = id.strip_suffix('.') else {
-        return text.to_owned();
-    };
-    let suffix = format!(" ({id})");
-    let name = label.strip_suffix(&suffix).unwrap_or(label);
+    let name = label
+        .rsplit_once(" (")
+        .filter(|(name, _)| !name.is_empty() && label.ends_with(')'))
+        .map_or(label, |(name, _)| name);
     format!("Message from {name}\n\n{body}")
 }
 
@@ -9063,6 +9075,38 @@ impl Render for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_message_display_handles_both_header_variants() {
+        let plain = "[Message from Zeron chat Alpha (chat-al). Reply to it with the Zeron `send_message` tool, chat chat-al.]
+
+body";
+        assert_eq!(
+            agent_message_display(plain),
+            "Message from Alpha
+
+body"
+        );
+        let notify = "[Message from Zeron chat Alpha (chat-al). Zeron delivers the final message of your turn to that chat automatically — do not reply with send_message.]
+
+body";
+        assert_eq!(
+            agent_message_display(notify),
+            "Message from Alpha
+
+body"
+        );
+        let notify_untitled = "[Message from Zeron chat chat-al. Zeron delivers the final message of your turn to that chat automatically — do not reply with send_message.]
+
+body";
+        assert_eq!(
+            agent_message_display(notify_untitled),
+            "Message from chat-al
+
+body"
+        );
+        assert_eq!(agent_message_display("typed text"), "typed text");
+    }
 
     #[test]
     fn jump_button_stays_available_when_scrolling_down_until_near_bottom() {

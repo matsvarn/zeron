@@ -1065,7 +1065,7 @@ impl Tools {
         let baseline = session_for(&sessions, &chat);
         let mode = args.mode.as_deref().unwrap_or("auto");
         let sent_at = now_millis();
-        let body = self.attribute(&chat, text).await;
+        let body = self.attribute(&chat, text, args.notify).await;
         let mut result = json!({
             "chatId": chat.id,
             "title": chat.title,
@@ -1382,7 +1382,7 @@ impl Tools {
     /// Prefix the sender's identity when this server speaks for a chat, so
     /// the receiving agent (and the human reading that transcript) can tell
     /// an agent-to-agent message from a typed one.
-    async fn attribute(&self, target: &Chat, text: &str) -> String {
+    async fn attribute(&self, target: &Chat, text: &str, notify: bool) -> String {
         let Some(origin_id) = self.zeron.origin().chat_id.as_deref() else {
             return text.to_owned();
         };
@@ -1399,10 +1399,19 @@ impl Tools {
             }
             _ => short(origin_id).to_owned(),
         };
-        format!(
-            "[Message from Zeron chat {label}. Reply to it with the Zeron `send_message` tool, chat {}.]\n\n{text}",
-            short(origin_id)
-        )
+        if notify {
+            // The turn's final message is delivered to the caller
+            // automatically — telling the task to send_message would double
+            // the answer.
+            format!(
+                "[Message from Zeron chat {label}. Zeron delivers the final message of your turn to that chat automatically — do not reply with send_message.]\n\n{text}"
+            )
+        } else {
+            format!(
+                "[Message from Zeron chat {label}. Reply to it with the Zeron `send_message` tool, chat {}.]\n\n{text}",
+                short(origin_id)
+            )
+        }
     }
 
     /// Pick and perform the delivery the composer would, with an optional
@@ -2311,6 +2320,19 @@ do it"
             .find(|(m, _)| m == methods::QUEUE_COMMAND)
             .unwrap();
         assert_eq!(command.1["notify"]["batch"], batch);
+        // The armed message must NOT tell the task to reply with send_message
+        // — the final message is delivered automatically, so that answer
+        // would reach the caller twice.
+        let prompt = command.1["command"]["request"]["prompt"].as_str().unwrap();
+        assert!(prompt.starts_with("[Message from Zeron chat "), "{prompt}");
+        assert!(
+            prompt.contains("delivers the final message of your turn"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("Reply to it with"), "{prompt}");
+        // The origin's chat id appears exactly once (inside the label), not
+        // duplicated as "(id) (id)".
+        assert_eq!(prompt.matches("chat-al").count(), 1, "{prompt}");
     }
 
     #[tokio::test]
