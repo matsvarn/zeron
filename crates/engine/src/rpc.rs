@@ -141,7 +141,8 @@ struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
     /// Delegated-task arming: `notify: { batch }` records that this command's
-    /// turn owes the chat's delegator a notice.
+    /// turn owes the chat's delegator a notice; `seal: true` marks the batch
+    /// complete (single-call paths — batch tools seal separately).
     #[serde(default)]
     notify: Option<NotifyParams>,
     /// Queued attachments (bytes already committed locally as `pending://`
@@ -155,6 +156,9 @@ struct QueueCommandParams {
 #[serde(rename_all = "camelCase")]
 struct NotifyParams {
     batch: String,
+    /// This arm is the batch's last member: release as soon as it settles.
+    #[serde(default)]
+    seal: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1875,6 +1879,14 @@ impl RpcService for EngineRpc {
                     .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
                 {
                     Ok(command_id) => {
+                        if let Some(notify) = &p.notify
+                            && notify.seal
+                            && let Some(delegation) = self.delegation.as_ref()
+                            && let Ok(Some(chat)) = self.workspace.chat(&p.chat_id)
+                            && let Some(by) = chat.delegation.map(|d| d.by)
+                        {
+                            delegation.seal_batch(&by, &notify.batch).await;
+                        }
                         RpcReply::value(&serde_json::json!({ "commandId": command_id }))
                     }
                     Err(err) => {
@@ -1886,6 +1898,21 @@ impl RpcService for EngineRpc {
                         return Err(RpcError::Failed(err.to_string()));
                     }
                 }
+            }
+            methods::SEAL_DELEGATION_BATCH => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct SealParams {
+                    delegator: String,
+                    batch: String,
+                }
+                let p: SealParams = parse_params(params)?;
+                self.delegation
+                    .as_ref()
+                    .ok_or_else(|| RpcError::Failed("delegation engine not wired".into()))?
+                    .seal_batch(&p.delegator, &p.batch)
+                    .await;
+                RpcReply::value(&serde_json::json!({}))
             }
             methods::CANCEL_DELEGATED_TASK => {
                 let p: ChatParams = parse_params(params)?;

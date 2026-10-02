@@ -525,16 +525,22 @@ impl Tools {
         ))
         .await;
         let mut out = json!({"results": results});
-        if results.iter().any(|r| {
+        let any_armed = results.iter().any(|r| {
             r["result"]
                 .get("task")
                 .and_then(|t| t.get("notify"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
-                || r["result"].get("notify") == Some(&Value::Bool(true))
-        }) && let Some(batch) = batch
-        {
+        });
+        if any_armed && let Some(batch) = batch {
             out["batch"] = json!(batch);
+            // Every request has finished — arm-failed requests are not part
+            // of the batch. Seal it so the engine may release the notice.
+            if let Some(delegator) = self.zeron.origin().chat_id.clone()
+                && let Err(err) = self.zeron.seal_delegation_batch(&delegator, &batch).await
+            {
+                tracing::warn!(error = %err, "sealing the delegation batch failed");
+            }
         }
         Ok(out)
     }
@@ -927,6 +933,9 @@ impl Tools {
                 room_gen: None,
             };
             let (prompt, batch) = if args.notify {
+                // `batch` absent means a lone create_chat — seal with the
+                // arm; a shared batch seals once after the batch tool ends.
+                let shared = batch.is_some();
                 let batch = result["task"]["batch"]
                     .as_str()
                     .expect("notify result carries a batch")
@@ -944,7 +953,7 @@ impl Tools {
 {prompt}",
                         short(origin_id.as_deref().unwrap_or_default())
                     ),
-                    Some(batch),
+                    Some((batch, !shared)),
                 )
             } else {
                 (prompt, None)
@@ -957,7 +966,7 @@ impl Tools {
                     None,
                     prompt,
                     "run",
-                    batch.as_deref(),
+                    batch.as_ref().map(|(b, s)| (b.as_str(), *s)),
                 )
                 .await
                 .map_err(notify_error)?;
@@ -1061,6 +1070,7 @@ impl Tools {
             "chatId": chat.id,
             "title": chat.title,
         });
+        let shared = batch.is_some();
         let batch = if args.notify {
             batch
                 .map(str::to_owned)
@@ -1076,7 +1086,7 @@ impl Tools {
                 baseline.as_ref(),
                 body,
                 mode,
-                batch.as_deref(),
+                batch.as_deref().map(|b| (b, !shared)),
             )
             .await
             .map_err(notify_error)?;
@@ -1374,7 +1384,7 @@ impl Tools {
         session: Option<&Session>,
         text: String,
         mode: &str,
-        notify: Option<&str>,
+        notify: Option<(&str, bool)>,
     ) -> anyhow::Result<Value> {
         let harness = chat
             .config
@@ -1655,6 +1665,13 @@ mod tests {
                       "parts": [{ "kind": "text", "id": "t", "text": "hello back" }] }
                 ]})),
                 methods::LIST_DELEGATIONS => RpcReply::Value(json!({ "tasks": self.delegations })),
+                methods::SEAL_DELEGATION_BATCH => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params));
+                    RpcReply::Value(json!({}))
+                }
                 methods::CANCEL_DELEGATED_TASK => {
                     self.writes
                         .lock()
@@ -2642,6 +2659,89 @@ do it"
         assert_eq!(
             whoami["result"]["structuredContent"]["localDeviceId"],
             "dev-local"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_chats_seals_its_batch_once_after_all_requests() {
+        // One seal call after every arm lands, even with a failed request —
+        // the unsealed batch must never release on a fast finisher alone.
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let reply = tools
+            .call(
+                "create_chats",
+                json!({ "requests": [
+                    { "project": "/repo/comet", "prompt": "one", "notify": true },
+                    { "project": "/repo/comet", "harness": "not-a-harness", "prompt": "bad", "notify": true },
+                    { "project": "/repo/comet", "prompt": "two", "notify": true },
+                ]}),
+            )
+            .await
+            .unwrap();
+        let batch = reply["batch"].as_str().expect("top-level batch");
+        let writes = world.writes.lock().unwrap();
+        let arms: Vec<_> = writes
+            .iter()
+            .filter(|(m, _)| m == methods::QUEUE_COMMAND)
+            .collect();
+        assert_eq!(arms.len(), 2);
+        assert!(arms.iter().all(|(_, p)| p["notify"]["seal"] == false));
+        let seals: Vec<_> = writes
+            .iter()
+            .filter(|(m, _)| m == methods::SEAL_DELEGATION_BATCH)
+            .collect();
+        assert_eq!(seals.len(), 1, "exactly one seal, after the arms");
+        assert_eq!(seals[0].1["batch"], batch);
+        assert_eq!(seals[0].1["delegator"], "chat-alpha-1");
+        let seal_pos = writes
+            .iter()
+            .position(|(m, _)| m == methods::SEAL_DELEGATION_BATCH)
+            .unwrap();
+        let last_arm = writes
+            .iter()
+            .rposition(|(m, _)| m == methods::QUEUE_COMMAND)
+            .unwrap();
+        assert!(seal_pos > last_arm, "seal lands after every arm");
+    }
+
+    #[tokio::test]
+    async fn a_single_notify_create_chat_seals_with_the_arm() {
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        tools
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "prompt": "go", "notify": true }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        let (m, p) = writes
+            .iter()
+            .find(|(m, _)| m == methods::QUEUE_COMMAND)
+            .unwrap();
+        assert_eq!(m, methods::QUEUE_COMMAND);
+        assert_eq!(p["notify"]["seal"], true);
+        assert!(
+            writes
+                .iter()
+                .all(|(m, _)| m != methods::SEAL_DELEGATION_BATCH)
         );
     }
 }

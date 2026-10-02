@@ -90,11 +90,30 @@ struct Armed {
     settled: Option<Settled>,
 }
 
+/// A batch's release gate: an armed task's batch may contain members that
+/// have not armed yet (batch tools arm each request separately), so only a
+/// sealed batch may release. `first_armed_at_ms` bounds the wait: an
+/// unsealed batch seals itself 60 s after its first arm.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Seal {
+    delegator: String,
+    batch: String,
+    sealed: bool,
+    first_armed_at_ms: i64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct Ledger {
     tasks: Vec<Armed>,
+    #[serde(default)]
+    seals: Vec<Seal>,
 }
+
+/// How long an unsealed batch may wait for late members before the engine
+/// seals and releases it on its own.
+const AUTO_SEAL: Duration = Duration::from_secs(60);
 
 /// One armed task's outcome, or why it hasn't settled.
 enum IdleVerdict {
@@ -140,6 +159,8 @@ struct Inner {
     /// saves — an arm on the RPC path racing a settle write — can rename over
     /// each other and lose the file. Serialize the write here.
     save_lock: Mutex<()>,
+    /// Injectable auto-seal window for tests (`AUTO_SEAL` in production).
+    auto_seal: Mutex<Duration>,
     /// Serializes every settle path: worker pass, rechecks, boot, cancel.
     settle: tokio::sync::Mutex<()>,
     workspace: WorkspaceHost,
@@ -182,6 +203,7 @@ impl DelegationEngine {
                 ledger: Mutex::new(ledger),
                 scheduled: Mutex::new(HashMap::new()),
                 save_lock: Mutex::new(()),
+                auto_seal: Mutex::new(AUTO_SEAL),
                 settle: tokio::sync::Mutex::new(()),
                 workspace,
                 doc_host,
@@ -223,8 +245,27 @@ impl DelegationEngine {
                 let _settle = engine.inner.settle.lock().await;
                 engine.boot_pass().await;
             }
+            // Status ticks alone can go quiet while settled work waits on
+            // the auto-seal, so a slow tick keeps passes running while the
+            // ledger holds anything.
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                if rx.changed().await.is_err() || engine.inner.stopping.load(Ordering::Acquire) {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    _ = tick.tick() => {
+                        let ledger = lock(&engine.inner.ledger);
+                        let busy = !ledger.tasks.is_empty()
+                            || !ledger.seals.is_empty();
+                        drop(ledger);
+                        if !busy {
+                            continue;
+                        }
+                    }
+                }
+                if engine.inner.stopping.load(Ordering::Acquire) {
                     break;
                 }
                 engine.run_pass().await;
@@ -290,6 +331,21 @@ impl DelegationEngine {
                 }
             }
         };
+        {
+            let mut ledger = lock(&self.inner.ledger);
+            if !ledger
+                .seals
+                .iter()
+                .any(|seal| seal.delegator == delegation.by && seal.batch == batch)
+            {
+                ledger.seals.push(Seal {
+                    delegator: delegation.by.clone(),
+                    batch: batch.to_string(),
+                    sealed: false,
+                    first_armed_at_ms: now_ms(),
+                });
+            }
+        }
         self.save()?;
         Ok(undo)
     }
@@ -341,6 +397,15 @@ impl DelegationEngine {
         {
             let mut ledger = lock(&self.inner.ledger);
             ledger.tasks.retain(|t| !subtree.contains(&t.chat_id));
+            // A seal whose members were all cancelled releases nothing.
+            let live: Vec<(String, String)> = ledger
+                .tasks
+                .iter()
+                .map(|t| (t.delegator.clone(), t.batch.clone()))
+                .collect();
+            ledger
+                .seals
+                .retain(|seal| live.contains(&(seal.delegator.clone(), seal.batch.clone())));
         }
         if let Err(err) = self.save() {
             tracing::warn!(error = %err, "delegation ledger write failed");
@@ -427,11 +492,13 @@ impl DelegationEngine {
     #[doc(hidden)]
     pub async fn run_pass(&self) {
         let _settle = self.inner.settle.lock().await;
+        self.auto_seal_expired();
         self.evaluate_all().await;
         self.release_complete_batches().await;
     }
 
     async fn boot_pass(&self) {
+        self.auto_seal_expired();
         self.evaluate_all().await;
         self.release_complete_batches().await;
     }
@@ -451,6 +518,70 @@ impl DelegationEngine {
             .filter(|t| t.settled.is_none())
             .map(|t| t.chat_id.clone())
             .collect()
+    }
+
+    /// `SealDelegationBatch { delegator, batch }`: mark the batch complete —
+    /// no more members will arm — then release it if every member has
+    /// settled. Sealing a batch with no members just drops the seal. Called
+    /// from the RPC handler, under the settle lock.
+    pub async fn seal_batch(&self, delegator: &str, batch: &str) {
+        let _settle = self.inner.settle.lock().await;
+        {
+            let mut ledger = lock(&self.inner.ledger);
+            if ledger
+                .tasks
+                .iter()
+                .any(|t| t.delegator == delegator && t.batch == batch)
+            {
+                if let Some(seal) = ledger
+                    .seals
+                    .iter_mut()
+                    .find(|seal| seal.delegator == delegator && seal.batch == batch)
+                {
+                    seal.sealed = true;
+                }
+            } else {
+                ledger
+                    .seals
+                    .retain(|seal| !(seal.delegator == delegator && seal.batch == batch));
+            }
+        }
+        if let Err(err) = self.save() {
+            tracing::warn!(error = %err, "delegation ledger write failed");
+        }
+        self.release_batch(delegator, batch).await;
+    }
+
+    /// A batch whose caller never sealed (a crashed tool call, a probe, an
+    /// engine that armed without `seal`) releases on its own after
+    /// `auto_seal` from its first arm.
+    fn auto_seal_expired(&self) {
+        let timeout = *lock(&self.inner.auto_seal);
+        let now = now_ms();
+        let mut expired = Vec::new();
+        {
+            let mut ledger = lock(&self.inner.ledger);
+            for seal in &mut ledger.seals {
+                if !seal.sealed && now - seal.first_armed_at_ms >= timeout.as_millis() as i64 {
+                    seal.sealed = true;
+                    expired.push(seal.batch.clone());
+                }
+            }
+        }
+        if !expired.is_empty() {
+            for batch in &expired {
+                tracing::warn!(batch = %batch, "delegation batch auto-sealed after timeout");
+            }
+            if let Err(err) = self.save() {
+                tracing::warn!(error = %err, "delegation ledger write failed");
+            }
+        }
+    }
+
+    /// Test knob for the auto-seal window.
+    #[doc(hidden)]
+    pub fn set_auto_seal_timeout(&self, timeout: Duration) {
+        *lock(&self.inner.auto_seal) = timeout;
     }
 
     /// One armed task's settle check. Idempotent: safe at boot, on every
@@ -687,7 +818,11 @@ impl DelegationEngine {
                 .filter(|t| t.delegator == delegator && t.batch == batch)
                 .cloned()
                 .collect();
-            if members.is_empty() || members.iter().any(|t| t.settled.is_none()) {
+            let sealed = ledger
+                .seals
+                .iter()
+                .any(|seal| seal.delegator == delegator && seal.batch == batch && seal.sealed);
+            if !sealed || members.is_empty() || members.iter().any(|t| t.settled.is_none()) {
                 return;
             }
             members
@@ -717,6 +852,10 @@ impl DelegationEngine {
             ledger
                 .tasks
                 .retain(|t| !(t.delegator == delegator && t.batch == batch));
+            // The batch is gone — so is its seal.
+            ledger
+                .seals
+                .retain(|seal| !(seal.delegator == delegator && seal.batch == batch));
         }
         if let Err(err) = self.save() {
             tracing::warn!(error = %err, "delegation ledger write failed");

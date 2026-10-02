@@ -270,19 +270,21 @@ fn run_request(prompt: &str) -> RunRequest {
     }
 }
 
-/// `QueueCommand` with an optional `notify: { batch }`.
+/// `QueueCommand` with an optional `notify: { batch, seal }`. A lone arm
+/// seals at once, matching the MCP's single-call path; batch callers pass
+/// `seal: false` and seal afterwards through `SealDelegationBatch`.
 async fn queue_command(
     client: &RpcClient,
     chat: &str,
     command: SessionCommandPayload,
-    batch: Option<&str>,
+    batch: Option<(&str, bool)>,
 ) -> Result<(), zeron_rpc::RpcError> {
     let mut params = serde_json::json!({
         "chatId": chat,
         "command": serde_json::to_value(&command).unwrap(),
     });
-    if let Some(batch) = batch {
-        params["notify"] = serde_json::json!({ "batch": batch });
+    if let Some((batch, seal)) = batch {
+        params["notify"] = serde_json::json!({ "batch": batch, "seal": seal });
     }
     client
         .call(methods::QUEUE_COMMAND, params)
@@ -305,7 +307,7 @@ async fn run_chat(
             request: run_request(prompt),
             message_id: message_id.into(),
         },
-        batch,
+        batch.map(|b| (b, true)),
     )
     .await
     .expect("queue run command");
@@ -1227,7 +1229,7 @@ async fn an_armed_message_held_behind_a_running_turn_reports_the_later_turn() {
             prompt: "second job".into(),
             message_id: Some("m-task-2".into()),
         },
-        Some("b1"),
+        Some(("b1", true)),
     )
     .await
     .unwrap();
@@ -1726,7 +1728,7 @@ async fn rearming_a_task_keeps_its_batch() {
             prompt: "keep going".into(),
             message_id: Some("m-task-2".into()),
         },
-        Some("b-B"),
+        Some(("b-B", true)),
     )
     .await
     .unwrap();
@@ -1865,7 +1867,7 @@ async fn notify_is_rejected_when_the_task_is_hosted_elsewhere() {
             request: run_request("job"),
             message_id: "m-1".into(),
         },
-        Some("b1"),
+        Some(("b1", true)),
     )
     .await
     .unwrap_err()
@@ -1894,7 +1896,7 @@ async fn notify_is_rejected_for_a_chat_that_is_not_a_task() {
                 request: run_request("job"),
                 message_id: format!("m-{chat}"),
             },
-            Some("b1"),
+            Some(("b1", true)),
         )
         .await
         .unwrap_err()
@@ -1919,7 +1921,7 @@ async fn notify_needs_a_message_id() {
             prompt: "job".into(),
             message_id: None,
         },
-        Some("b1"),
+        Some(("b1", true)),
     )
     .await
     .unwrap_err()
@@ -2194,12 +2196,40 @@ async fn cancelling_the_last_outstanding_task_lets_the_delegator_task_settle() {
 
 // ── restart durability ──────────────────────────────────────────────────────
 
+/// Rewrite the ledger file. `seals` defaults to a sealed row for every
+/// batch in `tasks` (a sealed batch that crashed mid-release still owes
+/// its notice); pass `[]` to exercise the unsealed/auto-seal path.
 fn write_ledger(dir: &std::path::Path, tasks: serde_json::Value) {
+    write_ledger_seals(dir, tasks, None)
+}
+
+fn write_ledger_seals(
+    dir: &std::path::Path,
+    tasks: serde_json::Value,
+    seals: Option<serde_json::Value>,
+) {
+    let seals = seals.unwrap_or_else(|| {
+        serde_json::json!(
+            tasks
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "delegator": t["delegator"],
+                        "batch": t["batch"],
+                        "sealed": true,
+                        "firstArmedAtMs": 1,
+                    })
+                })
+                .collect::<Vec<_>>()
+        )
+    });
     let root = dir.join("orgs/dev-org/dev-user");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join("delegations.json"),
-        serde_json::to_vec(&serde_json::json!({ "tasks": tasks })).unwrap(),
+        serde_json::to_vec(&serde_json::json!({ "tasks": tasks, "seals": seals })).unwrap(),
     )
     .unwrap();
 }
@@ -2211,6 +2241,21 @@ async fn an_armed_task_survives_a_clean_restart() {
     delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
     wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
     harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    // The finish is asynchronous: wait for the complete entry to land so
+    // the shutdown races only settle/delivery, not the transcript commit —
+    // a restart whose transcript never saw the turn end settles the task as
+    // interrupted and that variant has its own tests.
+    wait_for(
+        || {
+            entries(&core, "task-1")
+                .iter()
+                .rev()
+                .find(|e| e.role == MessageRole::Assistant)
+                .is_some_and(|e| e.status == Some(MessageStatus::Complete))
+        },
+        "the finished turn to commit",
+    )
+    .await;
     // Whether or not the notice beat the shutdown, the restart must leave
     // the delegator with exactly one copy.
     core.shutdown().await;
@@ -2564,5 +2609,180 @@ async fn a_stale_settle_verdict_cannot_consume_a_re_arm() {
         "the re-armed entry is untouched"
     );
     assert_eq!(notices(&core, "root").len(), 1, "no second notice");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsealed_batch_does_not_release_even_when_all_armed_members_settled() {
+    // Batch callers arm each request separately; the engine must not read
+    // "all currently armed members settled" as "the batch is done".
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    queue_command(
+        &client,
+        "task-1",
+        SessionCommandPayload::Run {
+            request: run_request("job"),
+            message_id: "m-task-1".into(),
+        },
+        Some(("b1", false)),
+    )
+    .await
+    .unwrap();
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(|| ledger(&core)[0].2, "task-1 settles").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(notices(&core, "root").is_empty(), "unsealed: no notice");
+
+    client
+        .call(
+            methods::SEAL_DELEGATION_BATCH,
+            serde_json::json!({ "delegator": "root", "batch": "b1" }),
+        )
+        .await
+        .unwrap();
+    wait_for(|| notices(&core, "root").len() == 1, "sealed: the notice").await;
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fast_failing_member_does_not_release_the_batch_before_its_siblings_arm() {
+    // The race that motivated seals: A errors before B's arm lands. Without
+    // sealing, A's settle releases "b1" alone and B's later notice is deduped.
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-A", None)
+        .await
+        .unwrap();
+    delegate(&client, &core.device_id, "root", "task-B", None)
+        .await
+        .unwrap();
+    queue_command(
+        &client,
+        "task-A",
+        SessionCommandPayload::Run {
+            request: run_request("job A"),
+            message_id: "m-A".into(),
+        },
+        Some(("b1", false)),
+    )
+    .await
+    .unwrap();
+    wait_for(|| !harness.runs_for("task-A").is_empty(), "A run").await;
+    harness.finish("task-A", Finish::Complete("RESULT-A".into()));
+    wait_for(
+        || {
+            ledger(&core)
+                .iter()
+                .any(|(id, _, settled)| id == "task-A" && *settled)
+        },
+        "A settles",
+    )
+    .await;
+    // Now B arms — the batch is unsealed, so nothing released for A alone.
+    queue_command(
+        &client,
+        "task-B",
+        SessionCommandPayload::Run {
+            request: run_request("job B"),
+            message_id: "m-B".into(),
+        },
+        Some(("b1", false)),
+    )
+    .await
+    .unwrap();
+    client
+        .call(
+            methods::SEAL_DELEGATION_BATCH,
+            serde_json::json!({ "delegator": "root", "batch": "b1" }),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        notices(&core, "root").is_empty(),
+        "B still owes; no partial notice"
+    );
+    wait_for(|| !harness.runs_for("task-B").is_empty(), "B run").await;
+    harness.finish("task-B", Finish::Complete("RESULT-B".into()));
+    wait_for(|| notices(&core, "root").len() == 1, "the one notice").await;
+    let notice = notices(&core, "root")[0].clone();
+    assert!(
+        notice.contains("RESULT-A") && notice.contains("RESULT-B"),
+        "{notice}"
+    );
+    assert_eq!(notices(&core, "root").len(), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsealed_batch_auto_seals_after_the_timeout() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    core.delegation
+        .set_auto_seal_timeout(Duration::from_millis(50));
+    queue_command(
+        &client,
+        "task-1",
+        SessionCommandPayload::Run {
+            request: run_request("job"),
+            message_id: "m-task-1".into(),
+        },
+        Some(("b1", false)),
+    )
+    .await
+    .unwrap();
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    // Nobody seals; the timeout does, on a later pass.
+    wait_for(
+        || {
+            let _core = &core;
+            notices(_core, "root").len() == 1
+        },
+        "auto-sealed notice",
+    )
+    .await;
+    assert!(notices(&core, "root")[0].contains("RESULT-1"));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seal_survives_a_restart() {
+    // A sealed-but-unreleased batch in the file releases at boot without a
+    // SealDelegationBatch call.
+    let (dir, core, _harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    write_ledger_seals(
+        dir.path(),
+        serde_json::json!([{
+            "chatId": "task-1",
+            "delegator": "root",
+            "batch": "b1",
+            "messageId": "m-task-1",
+            "settled": { "outcome": "completed", "atMs": 1 },
+        }]),
+        Some(serde_json::json!([{
+            "delegator": "root", "batch": "b1",
+            "sealed": true, "firstArmedAtMs": 1,
+        }])),
+    );
+    core.shutdown().await;
+    drop(core);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    core.sessions.set_ipc_port(27655);
+    wait_for(|| notices(&core, "root").len() == 1, "boot pass releases").await;
     core.shutdown().await;
 }

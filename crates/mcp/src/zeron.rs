@@ -303,18 +303,21 @@ impl Zeron {
         self.queue_command_notify(chat_id, payload, None).await
     }
 
-    /// `queue_command` plus a `notify: { batch }` arm on the host engine's
-    /// delegation ledger (docs/design/delegated-tasks.md).
+    /// `queue_command` plus a `notify: { batch, seal }` arm on the host
+    /// engine's delegation ledger (docs/design/delegated-tasks.md). `seal`
+    /// marks the batch complete: only sealed batches release a notice, so
+    /// multi-call batches seal once via `seal_delegation_batch` after their
+    /// last arm lands.
     pub async fn queue_command_notify(
         &self,
         chat_id: &str,
         payload: &SessionCommandPayload,
-        notify: Option<&str>,
+        notify: Option<(&str, bool)>,
     ) -> anyhow::Result<String> {
         let command = serde_json::to_value(payload).context("serialize command")?;
         let mut params = json!({ "chatId": chat_id, "command": command });
-        if let Some(batch) = notify {
-            params["notify"] = json!({ "batch": batch });
+        if let Some((batch, seal)) = notify {
+            params["notify"] = json!({ "batch": batch, "seal": seal });
         }
         let reply = self.call(methods::QUEUE_COMMAND, params).await?;
         Ok(reply
@@ -332,6 +335,17 @@ impl Zeron {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+
+    /// Mark a delegation batch complete: every member that will arm has
+    /// armed, so the engine may release its notice when they settle.
+    pub async fn seal_delegation_batch(&self, delegator: &str, batch: &str) -> anyhow::Result<()> {
+        self.call(
+            methods::SEAL_DELEGATION_BATCH,
+            json!({ "delegator": delegator, "batch": batch }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Stop a task and its subtree; no notices are sent for any of them.

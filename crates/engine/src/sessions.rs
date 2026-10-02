@@ -905,7 +905,19 @@ impl SessionsEngine {
             };
             self.inner.publish(&chat_id, &done);
             let stamped = handle.mark_abandoned_streams(note)?.len();
-            self.set_status(&chat_id, SessionStatus::Idle, false);
+            // A run about to be revived reads as Working at once: the
+            // dispatch is asynchronous, and the delegation ledger's boot
+            // pass must not settle an `Idle`+`Aborted` revival window as
+            // interrupted. A failed dispatch below stamps Errored instead.
+            self.set_status(
+                &chat_id,
+                if will_resume {
+                    SessionStatus::Working
+                } else {
+                    SessionStatus::Idle
+                },
+                false,
+            );
             tracing::info!(chat = %chat_id, stamped, will_resume, attempts, "recovered stale session journal");
             recovered += 1;
 
@@ -965,6 +977,7 @@ impl SessionsEngine {
                         tracing::info!(chat = %chat_id, attempt, "auto-resumed crashed run")
                     }
                     Err(err) => {
+                        sessions.set_status(&chat_id, SessionStatus::Errored, false);
                         tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed")
                     }
                 }
