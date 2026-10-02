@@ -29,20 +29,24 @@ one, and the server refuses to message its own chat. The transcript renders
 this routing header as “Message from **chat name**”, keeping the full routing
 instructions in the stored prompt for agents.
 
-### Parent links
+### Parent links and delegated tasks
 
-A chat created through `create_chat` records the creating chat as its parent:
-`Chat.parent_chat_id` (proto) ⇄ `parentChatId` on the registry/workspace chat
-row (`Mutate createChat { parentChatId? }` → `WorkspaceHost::create_chat_with_parent`).
-Chats with a parent cannot create chats through MCP, including batch creation
-or an explicit parent override. A side chat cannot be selected as a parent;
-only one level of side chats is supported.
+A chat created by another chat through `create_chat` is a delegated task: the
+mutation carries `delegatedBy`, and the engine writes `delegation { by, depth }`
+on the row. `parentChatId` still points at the top-level root chat so tasks of
+tasks list under the same root; `delegation.by` names the actual delegator and
+`list_chats { parent }` matches it when the row has it. Delegated tasks may
+delegate further up to depth 2 and cannot exceed their own sandbox level.
+Forks and pre-existing side chats (a parent but no `delegation`) still cannot
+create chats; an explicit `parent` must equal the task's computed root.
 
-The default is the origin chat (`ZERON_CHAT_ID`); an explicit `parent` argument
-(id, prefix, or title) overrides it. `list_chats { parent }` returns a chat's
-children, and every chat summary carries `parentChatId`. The field is additive
-and serde-defaulted: rows written by older engines read as parentless, and a
-dangling id (parent deleted) is tolerated rather than cascaded.
+`notify: true` on `create_chat`, `create_chats`, `send_message`, or
+`send_messages` arms the engine's delivery: when the armed turn settles, the
+task's final message is delivered to the delegator — steered into a running
+turn or queued as the next. Requests in one batch call that set `notify`
+share a batch and report in one notice. `task_status` lists the delegation
+tree with states; `task_cancel` stops a task and its subtree with no notice.
+The design note is `docs/design/delegated-tasks.md` in the orchestrator repo.
 
 The left sidebar hides chats that have a parent: `AppState::visible_chats`
 (the Sessions list, project tabs, jump slots) and the Archived section both
@@ -106,14 +110,16 @@ name (default: the local engine's device).
 | `list_models`      | `ListModels {harness}`                                    |
 | `list_chats`       | `WatchChats` + `WatchSessions` snapshots (status merged)  |
 | `get_chat`         | above + `WatchDocMessages` opening frame (pending input)  |
-| `create_chat`      | `Mutate createChat` (+ `renameChat`; optional first send) |
+| `create_chat`      | `Mutate createChat` (+ `renameChat`; `QueueCommand` Run, optionally `notify`) |
 | `create_chats`     | Concurrent `create_chat` requests with per-request results |
 | `send_messages`    | Concurrent `send_message` requests with per-request results |
 | `read_chat`        | `WatchDocMessages` opening `reset` frame, rendered        |
-| `send_message`     | `QueueCommand` Run / Steer, or `QueueMessage`             |
+| `send_message`     | `QueueCommand` Run / Steer (optionally `notify`), or `QueueMessage` |
 | `wait_for_turn`    | `WatchSessions` until the chat settles                    |
 | `interrupt_chat`   | `QueueCommand` Interrupt                                  |
 | `respond_to_input` | `QueueCommand` RespondInput                               |
+| `task_status`      | `WatchChats` + `WatchSessions` + `ListDelegations`        |
+| `task_cancel`      | `CancelDelegatedTask` on the host engine                  |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
 
 Watch streams are the engine's only read surface (there is no one-shot "get

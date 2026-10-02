@@ -300,18 +300,44 @@ impl Zeron {
         chat_id: &str,
         payload: &SessionCommandPayload,
     ) -> anyhow::Result<String> {
+        self.queue_command_notify(chat_id, payload, None).await
+    }
+
+    /// `queue_command` plus a `notify: { batch }` arm on the host engine's
+    /// delegation ledger (docs/design/delegated-tasks.md).
+    pub async fn queue_command_notify(
+        &self,
+        chat_id: &str,
+        payload: &SessionCommandPayload,
+        notify: Option<&str>,
+    ) -> anyhow::Result<String> {
         let command = serde_json::to_value(payload).context("serialize command")?;
-        let reply = self
-            .call(
-                methods::QUEUE_COMMAND,
-                json!({ "chatId": chat_id, "command": command }),
-            )
-            .await?;
+        let mut params = json!({ "chatId": chat_id, "command": command });
+        if let Some(batch) = notify {
+            params["notify"] = json!({ "batch": batch });
+        }
+        let reply = self.call(methods::QUEUE_COMMAND, params).await?;
         Ok(reply
             .get("commandId")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned())
+    }
+
+    /// The host engine's delegation ledger (armed/settled task entries).
+    pub async fn list_delegations(&self) -> anyhow::Result<Vec<Value>> {
+        let reply = self.call(methods::LIST_DELEGATIONS, json!({})).await?;
+        Ok(reply
+            .get("tasks")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Stop a task and its subtree; no notices are sent for any of them.
+    pub async fn cancel_delegated_task(&self, chat_id: &str) -> anyhow::Result<Value> {
+        self.call(methods::CANCEL_DELEGATED_TASK, json!({ "chatId": chat_id }))
+            .await
     }
 
     /// Queue-row send for a busy chat whose harness cannot steer mid-turn:

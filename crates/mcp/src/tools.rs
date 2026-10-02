@@ -24,6 +24,11 @@ use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 const MAX_BATCH: usize = 32;
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
 const MAX_WAIT: Duration = Duration::from_secs(3600);
+/// Live delegated tasks (Working / AwaitingInput) allowed under one root.
+const MAX_LIVE_TASKS: usize = 16;
+/// The engine's delegation depth cap (`MAX_DELEGATION_DEPTH`), mirrored for
+/// `whoami`.
+const MAX_DELEGATION_DEPTH: u8 = 2;
 /// A session row older than this is not trusted to still be working
 /// (the UI's staleness window): a crashed host must not read as busy forever.
 const SESSION_STALE: chrono::Duration = chrono::Duration::seconds(45);
@@ -124,7 +129,12 @@ fn catalog() -> Vec<ToolDef> {
                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
                     "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
                     "prompt": { "type": "string", "description": "First message to send right away." },
-                    "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
+                    "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply. For work that takes more than a few seconds, use notify. Some harnesses sometimes move a long tool call to the background and the reply is lost." },
+                    "notify": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "With prompt: return at once. When the chat's work settles (completed, errored, or interrupted), Zeron sends its final message to your chat. The message is steered into your running turn where your harness supports it, and otherwise starts your next turn. Continue with other work or end your turn. Do not poll. Cannot be combined with wait."
+                    },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
                 }
             }),
@@ -145,13 +155,14 @@ fn catalog() -> Vec<ToolDef> {
             input_schema: chat_key_schema(json!({
                 "text": { "type": "string" },
                 "mode": { "type": "string", "enum": ["auto", "run", "steer", "queue"], "default": "auto" },
-                "wait": { "type": "boolean", "default": false },
+                "wait": { "type": "boolean", "default": false, "description": "Block until the turn finishes and return the reply. For work that takes more than a few seconds, use notify. Some harnesses sometimes move a long tool call to the background and the reply is lost." },
+                "notify": { "type": "boolean", "default": false, "description": "Arm the task for this turn: when it settles, Zeron sends its final message to your chat. Only for tasks you delegated. Cannot be combined with wait or mode 'queue'." },
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
             })),
         },
         ToolDef {
             name: "wait_for_turn",
-            description: "Block until a chat is no longer working: returns completed, awaitingInput (answer with respond_to_input), errored, or timedOut, with the newest assistant message.",
+            description: "Block until a chat is no longer working: returns completed, awaitingInput (answer with respond_to_input), errored, or timedOut, with the newest assistant message. For work that takes more than a few seconds, use notify. Some harnesses sometimes move a long tool call to the background and the reply is lost.",
             input_schema: chat_key_schema(json!({
                 "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
             })),
@@ -178,6 +189,28 @@ fn catalog() -> Vec<ToolDef> {
                     }
                 }
             })),
+        },
+        ToolDef {
+            name: "task_status",
+            description: "The tasks you delegated (with the tasks they delegated): state, notice state, and — for one chat — its final message.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat": { "type": "string", "description": "A delegated task (id, prefix, or title). Omit to list every task you delegated." },
+                    "reply_chars": { "type": "integer", "minimum": 0, "maximum": 100000, "default": 8000, "description": "With chat: how much of the task's final message to return." }
+                }
+            }),
+        },
+        ToolDef {
+            name: "task_cancel",
+            description: "Stop a delegated task and every task below it. Sends no notice.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "chat": { "type": "string", "description": "A delegated task (id, prefix, or title)." }
+                },
+                "required": ["chat"]
+            }),
         },
         ToolDef {
             name: "archive_chat",
@@ -259,6 +292,8 @@ struct CreateChatArgs {
     prompt: Option<String>,
     #[serde(default)]
     wait: bool,
+    #[serde(default)]
+    notify: bool,
     timeout_secs: Option<u64>,
 }
 
@@ -280,7 +315,15 @@ struct SendArgs {
     mode: Option<String>,
     #[serde(default)]
     wait: bool,
+    #[serde(default)]
+    notify: bool,
     timeout_secs: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct TaskStatusArgs {
+    chat: Option<String>,
+    reply_chars: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -331,6 +374,16 @@ fn parse_enum<T: serde::de::DeserializeOwned>(what: &str, raw: &str) -> Result<T
         .map_err(|_| format!("unknown {what}: {raw:?}"))
 }
 
+/// Title/request-id text that lands inside a notice header or a delegated
+/// task's prompt line: no line breaks or markup metacharacters, 80 chars.
+/// (Same rule as `sanitize_meta` in zeron-engine's delegation module.)
+fn sanitize_meta(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !matches!(c, '\n' | '\r' | '<' | '>' | '[' | ']' | '"'))
+        .take(80)
+        .collect()
+}
+
 // ---- summaries ---------------------------------------------------------------
 
 /// Live posture of one chat as the tools report it.
@@ -373,6 +426,8 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
         "reasoning": chat.config.as_ref().and_then(|c| c.reasoning),
         "archived": chat.archived,
         "parentChatId": chat.parent_chat_id,
+        "delegatedBy": chat.delegation.as_ref().map(|d| d.by.clone()),
+        "depth": chat.delegation.as_ref().map(|d| d.depth),
         "status": status,
         "statusAgeSecs": status_age,
         "lastMessageAt": chat.last_message_at,
@@ -419,6 +474,8 @@ impl Tools {
             "wait_for_turn" => self.wait_for_turn(parse(args)?).await,
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
+            "task_status" => self.task_status(parse(args)?).await,
+            "task_cancel" => self.task_cancel(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
@@ -427,34 +484,59 @@ impl Tools {
 
     /// Poll every request together, including its optional wait. A waiting
     /// first chat must not prevent subsequent chats from receiving their work.
+    /// All `notify` requests in one call share one batch — their results land
+    /// together in one notice.
     async fn batch(&self, args: BatchArgs, create: bool) -> anyhow::Result<Value> {
         anyhow::ensure!(
             (1..=MAX_BATCH).contains(&args.requests.len()),
             "requests must contain between 1 and {MAX_BATCH} items"
         );
+        let wants_notify =
+            |args: &Value| args.get("notify").and_then(Value::as_bool).unwrap_or(false);
+        let batch = args
+            .requests
+            .iter()
+            .any(wants_notify)
+            .then(|| uuid::Uuid::new_v4().to_string());
+        let shared_batch = batch.clone();
         let results = futures::future::join_all(args.requests.into_iter().enumerate().map(
-            |(index, args)| async move {
-                let result = if create {
-                    match serde_json::from_value(args) {
-                        Ok(args) => self.create_chat(args).await,
-                        Err(error) => Err(error.into()),
-                    }
-                } else {
-                    match serde_json::from_value(args) {
-                        Ok(args) => self.send_message(args).await,
-                        Err(error) => Err(error.into()),
-                    }
-                };
-                match result {
-                    Ok(result) => json!({"index": index, "isError": false, "result": result}),
-                    Err(error) => {
-                        json!({"index": index, "isError": true, "error": error.to_string()})
+            |(index, args)| {
+                let batch = shared_batch.clone();
+                async move {
+                    let result = if create {
+                        match serde_json::from_value::<CreateChatArgs>(args) {
+                            Ok(args) => self.create_chat_with_batch(args, batch.as_deref()).await,
+                            Err(error) => Err(error.into()),
+                        }
+                    } else {
+                        match serde_json::from_value::<SendArgs>(args) {
+                            Ok(args) => self.send_message_with_batch(args, batch.as_deref()).await,
+                            Err(error) => Err(error.into()),
+                        }
+                    };
+                    match result {
+                        Ok(result) => json!({"index": index, "isError": false, "result": result}),
+                        Err(error) => {
+                            json!({"index": index, "isError": true, "error": error.to_string()})
+                        }
                     }
                 }
             },
         ))
         .await;
-        Ok(json!({"results": results}))
+        let mut out = json!({"results": results});
+        if results.iter().any(|r| {
+            r["result"]
+                .get("task")
+                .and_then(|t| t.get("notify"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || r["result"].get("notify") == Some(&Value::Bool(true))
+        }) && let Some(batch) = batch
+        {
+            out["batch"] = json!(batch);
+        }
+        Ok(out)
     }
 
     async fn whoami(&self) -> anyhow::Result<Value> {
@@ -472,8 +554,26 @@ impl Tools {
             },
             None => Value::Null,
         };
+        let delegation = match origin.chat_id.as_deref() {
+            Some(id) => self.zeron.resolve_chat(id).await.ok().map(|chat| {
+                let depth = chat.delegation.as_ref().map(|d| d.depth);
+                let can_delegate = match &chat.delegation {
+                    Some(d) => d.depth < MAX_DELEGATION_DEPTH,
+                    // A top-level chat delegates; a side chat does not.
+                    None => chat.parent_chat_id.is_none(),
+                };
+                json!({
+                    "delegatedBy": chat.delegation.as_ref().map(|d| d.by.clone()),
+                    "depth": depth,
+                    "maxDepth": MAX_DELEGATION_DEPTH,
+                    "canDelegate": can_delegate,
+                })
+            }),
+            None => None,
+        };
         Ok(json!({
             "chat": chat,
+            "delegation": delegation.unwrap_or(Value::Null),
             "originDeviceId": origin.device_id,
             "localDeviceId": local_device,
             "workspaceScope": engine.get("workspaceScope").cloned().unwrap_or(Value::Null),
@@ -563,7 +663,13 @@ impl Tools {
         }
         if let Some(parent) = args.parent.as_deref() {
             let parent = self.zeron.resolve_chat(parent).await?;
-            chats.retain(|c| c.parent_chat_id.as_deref() == Some(parent.id.as_str()));
+            chats.retain(|c| {
+                c.delegation
+                    .as_ref()
+                    .map(|d| d.by.as_str())
+                    .or(c.parent_chat_id.as_deref())
+                    == Some(parent.id.as_str())
+            });
         }
         chats.sort_by(|a, b| {
             let a_at = a.last_message_at.unwrap_or(a.created_at);
@@ -596,11 +702,30 @@ impl Tools {
     }
 
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
-        if let Some(origin) = self.zeron.origin().chat_id.as_deref() {
-            let chat = self.zeron.resolve_chat(origin).await?;
+        self.create_chat_with_batch(args, None).await
+    }
+
+    /// `create_chat` with an optional shared `notify` batch (create_chats
+    /// mints one for the whole call).
+    async fn create_chat_with_batch(
+        &self,
+        args: CreateChatArgs,
+        batch: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let origin_id = self.zeron.origin().chat_id.clone();
+        let caller = match origin_id.as_deref() {
+            Some(id) => Some(self.zeron.resolve_chat(id).await?),
+            None => None,
+        };
+        if args.notify {
             anyhow::ensure!(
-                chat.parent_chat_id.is_none(),
-                "Side chats cannot create chats. Ask your parent chat to create another side chat."
+                args.prompt.as_deref().is_some_and(|p| !p.trim().is_empty()),
+                "notify needs a prompt"
+            );
+            anyhow::ensure!(!args.wait, "notify and wait cannot be combined");
+            anyhow::ensure!(
+                caller.is_some(),
+                "notify needs a calling chat; this server was not started by one"
             );
         }
         let harnesses = self.zeron.harnesses().await?;
@@ -636,8 +761,18 @@ impl Tools {
             Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
             None => None,
         };
+        // A delegated task's child defaults to at most its own sandbox level;
+        // the engine still enforces the cap, so this only sets the default.
+        let caller_level = caller
+            .as_ref()
+            .and_then(|c| c.config.as_ref())
+            .map(|c| c.sandbox)
+            .unwrap_or(SandboxLevel::WorkspaceWrite);
         let sandbox: SandboxLevel = match args.sandbox.as_deref() {
             Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
+            None if caller.as_ref().is_some_and(|c| c.delegation.is_some()) => {
+                caller_level.min(SandboxLevel::WorkspaceWrite)
+            }
             None => SandboxLevel::WorkspaceWrite,
         };
         let config = ChatConfig {
@@ -660,8 +795,10 @@ impl Tools {
             ),
         };
 
-        // Parent: the explicit `parent` argument, else the chat this server
-        // speaks for. Resolved so a prefix/title works and a typo fails loud.
+        // Speaking for a chat makes the new chat a delegated task: the
+        // engine derives parentChatId (the delegator's root) and enforces
+        // the fork/depth/sandbox rules, surfacing them as this call's error.
+        let delegated_by = origin_id.clone();
         let parent_chat_id = match args
             .parent
             .as_deref()
@@ -669,14 +806,34 @@ impl Tools {
             .filter(|p| !p.is_empty())
         {
             Some(key) => Some(self.zeron.resolve_chat(key).await?.id),
-            None => self.zeron.origin().chat_id.clone(),
+            None => None,
         };
-
-        if let Some(parent) = parent_chat_id.as_deref() {
-            let chat = self.zeron.resolve_chat(parent).await?;
+        // The live-task limit is an MCP-side check over the snapshots: the
+        // engine's rule set never refuses to create the row.
+        if let Some(caller) = caller.as_ref()
+            && args.prompt.is_some()
+        {
+            let root = caller
+                .parent_chat_id
+                .clone()
+                .unwrap_or_else(|| caller.id.clone());
+            let (chats, sessions) = tokio::try_join!(self.zeron.chats(), self.zeron.sessions())?;
+            let live = chats
+                .iter()
+                .filter(|c| c.delegation.is_some())
+                .filter(|c| c.parent_chat_id.as_deref() == Some(root.as_str()))
+                .filter(|c| {
+                    session_for(&sessions, c).is_some_and(|s| {
+                        matches!(
+                            s.status,
+                            SessionStatus::Working | SessionStatus::AwaitingInput
+                        )
+                    })
+                })
+                .count();
             anyhow::ensure!(
-                chat.parent_chat_id.is_none(),
-                "Cannot create a child of a side chat. Choose a top-level parent chat."
+                live < MAX_LIVE_TASKS,
+                "{MAX_LIVE_TASKS} delegated tasks are already running under this chat. Wait for a notice or cancel one with task_cancel."
             );
         }
         let chat_id = uuid::Uuid::new_v4().to_string();
@@ -686,6 +843,9 @@ impl Tools {
             "deviceId": device_id,
             "config": config,
         });
+        if let Some(by) = &delegated_by {
+            mutate["delegatedBy"] = json!(by);
+        }
         if let Some(space) = &space {
             mutate["spaceId"] = json!(space.id);
         }
@@ -715,6 +875,11 @@ impl Tools {
                 .await?;
         }
 
+        // The engine lists the task under its root: the delegator's own
+        // parent, or the delegator itself when it is top-level.
+        let listed_under = caller
+            .as_ref()
+            .and_then(|c| c.parent_chat_id.clone().or_else(|| Some(c.id.clone())));
         let mut result = json!({
             "chatId": chat_id,
             "deviceId": device_id,
@@ -723,8 +888,20 @@ impl Tools {
             "model": args.model,
             "reasoning": reasoning,
             "title": args.title,
-            "parentChatId": parent_chat_id,
+            "parentChatId": if delegated_by.is_some() { listed_under } else { parent_chat_id.clone() },
         });
+        if let Some(by) = &delegated_by {
+            result["task"] = json!({
+                "delegatedBy": by,
+                "depth": caller
+                    .as_ref()
+                    .and_then(|c| c.delegation.as_ref())
+                    .map(|d| d.depth + 1)
+                    .unwrap_or(1),
+                "notify": args.notify,
+                "batch": if args.notify { batch.map(str::to_owned).or_else(|| Some(uuid::Uuid::new_v4().to_string())) } else { None },
+            });
+        }
         if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
             // The row may not have folded into WatchChats yet; build the
             // chat locally from what we just wrote rather than re-reading.
@@ -749,9 +926,41 @@ impl Tools {
                 last_seen_at: None,
                 room_gen: None,
             };
+            let (prompt, batch) = if args.notify {
+                let batch = result["task"]["batch"]
+                    .as_str()
+                    .expect("notify result carries a batch")
+                    .to_owned();
+                let label = caller
+                    .as_ref()
+                    .and_then(|c| c.title.clone())
+                    .map(|t| sanitize_meta(&t))
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| short(origin_id.as_deref().unwrap_or("")).to_owned());
+                (
+                    format!(
+                        "[Delegated task from Zeron chat {label} ({}). Zeron delivers the final message of your turn to that chat automatically. Put the complete result in that message. Do not send the result with send_message.]
+
+{prompt}",
+                        short(origin_id.as_deref().unwrap_or_default())
+                    ),
+                    Some(batch),
+                )
+            } else {
+                (prompt, None)
+            };
             let sent = self
-                .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
-                .await?;
+                .deliver_notify(
+                    &chat,
+                    space.as_ref(),
+                    &harnesses,
+                    None,
+                    prompt,
+                    "run",
+                    batch.as_deref(),
+                )
+                .await
+                .map_err(notify_error)?;
             result["sent"] = sent;
             if args.wait {
                 result["turn"] = self
@@ -796,11 +1005,39 @@ impl Tools {
     }
 
     async fn send_message(&self, args: SendArgs) -> anyhow::Result<Value> {
+        self.send_message_with_batch(args, None).await
+    }
+
+    /// `send_message` with an optional shared `notify` batch (send_messages
+    /// mints one for the whole call).
+    async fn send_message_with_batch(
+        &self,
+        args: SendArgs,
+        batch: Option<&str>,
+    ) -> anyhow::Result<Value> {
         let text = args.text.trim();
         if text.is_empty() {
             anyhow::bail!("text is empty");
         }
         let chat = self.zeron.resolve_chat(&args.chat).await?;
+        if args.notify {
+            anyhow::ensure!(!args.wait, "notify and wait cannot be combined");
+            anyhow::ensure!(
+                args.mode.as_deref() != Some("queue"),
+                "notify cannot be combined with mode: queue"
+            );
+            let origin = self.zeron.origin().chat_id.clone();
+            anyhow::ensure!(
+                origin.is_some(),
+                "notify needs a calling chat; this server was not started by one"
+            );
+            anyhow::ensure!(
+                chat.delegation
+                    .as_ref()
+                    .is_some_and(|d| d.by.as_str() == origin.as_deref().unwrap()),
+                "notify works only for tasks you delegated"
+            );
+        }
         if self.zeron.origin().chat_id.as_deref() == Some(chat.id.as_str()) {
             anyhow::bail!(
                 "refusing to send a message to your own chat ({})",
@@ -824,9 +1061,28 @@ impl Tools {
             "chatId": chat.id,
             "title": chat.title,
         });
+        let batch = if args.notify {
+            batch
+                .map(str::to_owned)
+                .or_else(|| Some(uuid::Uuid::new_v4().to_string()))
+        } else {
+            None
+        };
         result["sent"] = self
-            .deliver(&chat, space, &harnesses, baseline.as_ref(), body, mode)
-            .await?;
+            .deliver_notify(
+                &chat,
+                space,
+                &harnesses,
+                baseline.as_ref(),
+                body,
+                mode,
+                batch.as_deref(),
+            )
+            .await
+            .map_err(notify_error)?;
+        if args.notify {
+            result["task"] = json!({ "notify": true, "batch": batch });
+        }
         if args.wait {
             result["turn"] = self
                 .await_turn(
@@ -909,6 +1165,176 @@ impl Tools {
         Ok(json!({ "chatId": chat.id, "requestId": request_id, "commandId": command_id }))
     }
 
+    /// `task_status`: the caller's delegation tree (or one task's reply).
+    async fn task_status(&self, args: TaskStatusArgs) -> anyhow::Result<Value> {
+        let (chats, sessions, delegations) = tokio::try_join!(
+            self.zeron.chats(),
+            self.zeron.sessions(),
+            self.zeron.list_delegations(),
+        )?;
+        let local = self.zeron.local_device_id().await.unwrap_or_default();
+        match args.chat.as_deref() {
+            None => {
+                let Some(origin) = self.zeron.origin().chat_id.clone() else {
+                    return Ok(json!({ "tasks": [] }));
+                };
+                let caller = self.zeron.resolve_chat(&origin).await?;
+                let tasks = self
+                    .task_tree(&caller, &chats, &sessions, &delegations, &local)
+                    .await;
+                Ok(json!({ "tasks": tasks }))
+            }
+            Some(key) => {
+                let chat = self.zeron.resolve_chat(key).await?;
+                let mut node = self
+                    .task_node(&chat, &chats, &sessions, &delegations, &local)
+                    .await;
+                let entries = self.zeron.transcript(&chat.id).await.unwrap_or_default();
+                let rendered = render_entries(&entries, RenderOptions::default());
+                let limit = args.reply_chars.unwrap_or(8_000).min(100_000);
+                let full = rendered
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == zeron_doc::MessageRole::Assistant)
+                    .map(|m| m.text.clone())
+                    .unwrap_or_default();
+                let truncated = full.chars().count() > limit;
+                node["reply"] = json!(full.chars().take(limit).collect::<String>());
+                node["replyTruncated"] = json!(truncated);
+                node["pendingInput"] = last_pending_input(&rendered).unwrap_or(Value::Null);
+                Ok(node)
+            }
+        }
+    }
+
+    /// One tree level of delegated children, recursively.
+    fn task_tree<'a>(
+        &'a self,
+        delegator: &'a Chat,
+        chats: &'a [Chat],
+        sessions: &'a [Session],
+        delegations: &'a [Value],
+        local: &'a str,
+    ) -> futures::future::BoxFuture<'a, Vec<Value>> {
+        Box::pin(async move {
+            let mut nodes = Vec::new();
+            for child in chats
+                .iter()
+                .filter(|c| c.delegation.as_ref().is_some_and(|d| d.by == delegator.id))
+            {
+                nodes.push(
+                    self.task_node(child, chats, sessions, delegations, local)
+                        .await,
+                );
+            }
+            nodes
+        })
+    }
+
+    /// One task's status row: registry + session + ledger, then the
+    /// transcript only when the state needs the last assistant entry.
+    async fn task_node(
+        &self,
+        chat: &Chat,
+        chats: &[Chat],
+        sessions: &[Session],
+        delegations: &[Value],
+        local: &str,
+    ) -> Value {
+        let tasks = self
+            .task_tree(chat, chats, sessions, delegations, local)
+            .await;
+        let session = session_for(sessions, chat);
+        let status_age = status_of(session.as_ref()).1;
+        let state = match session.as_ref().map(|s| s.status) {
+            Some(SessionStatus::Working) => "working".to_string(),
+            Some(SessionStatus::AwaitingInput) => "awaitingInput".to_string(),
+            Some(SessionStatus::Errored) => "errored".to_string(),
+            _ => {
+                let waiting = tasks.iter().any(|t| {
+                    matches!(
+                        t["state"].as_str(),
+                        Some("working" | "awaitingInput" | "waitingForTasks")
+                    )
+                });
+                if waiting {
+                    "waitingForTasks".to_string()
+                } else {
+                    let entries = self.zeron.transcript(&chat.id).await.unwrap_or_default();
+                    match entries
+                        .iter()
+                        .rev()
+                        .find(|e| e.role == zeron_doc::MessageRole::Assistant)
+                        .and_then(|e| e.status)
+                    {
+                        Some(zeron_doc::MessageStatus::Complete) => "completed",
+                        Some(zeron_doc::MessageStatus::Aborted) => "interrupted",
+                        _ => "idle",
+                    }
+                    .to_string()
+                }
+            }
+        };
+        // The ledger is host-local: a task hosted elsewhere reports unknown.
+        let ledger_entry = if chat.device_id == local {
+            delegations
+                .iter()
+                .find(|d| d["chatId"].as_str() == Some(chat.id.as_str()))
+        } else {
+            None
+        };
+        let notice = if chat.device_id != local {
+            "unknown"
+        } else {
+            ledger_entry
+                .and_then(|d| d["notice"].as_str())
+                .unwrap_or("none")
+        };
+        json!({
+            "chatId": chat.id,
+            "title": chat.title,
+            "harness": chat.config.as_ref().map(|c| c.harness),
+            "model": chat.config.as_ref().and_then(|c| c.model.clone()),
+            "delegatedBy": chat.delegation.as_ref().map(|d| d.by.clone()),
+            "depth": chat.delegation.as_ref().map(|d| d.depth),
+            "state": state,
+            "statusAgeSecs": status_age,
+            "notice": notice,
+            "batch": ledger_entry.and_then(|d| d["batch"].as_str().map(str::to_owned)),
+            "lastMessagePreview": chat.last_message_preview,
+            "tasks": tasks,
+        })
+    }
+
+    /// `task_cancel`: stop a task and its subtree, no notices.
+    async fn task_cancel(&self, args: ChatArgs) -> anyhow::Result<Value> {
+        let chat = self.zeron.resolve_chat(&args.chat).await?;
+        let local = self.zeron.local_device_id().await?;
+        anyhow::ensure!(
+            chat.device_id == local,
+            "task_cancel works only for tasks hosted on this device; use interrupt_chat instead"
+        );
+        // With a calling chat the target must sit below it in the
+        // delegation tree (delegation.by, not parentChatId).
+        if let Some(origin) = self.zeron.origin().chat_id.clone() {
+            let chats = self.zeron.chats().await?;
+            let mut cursor = chat.delegation.as_ref().map(|d| d.by.clone());
+            let mut ok = false;
+            while let Some(up) = cursor {
+                if up == origin {
+                    ok = true;
+                    break;
+                }
+                cursor = chats
+                    .iter()
+                    .find(|c| c.id == up)
+                    .and_then(|c| c.delegation.as_ref().map(|d| d.by.clone()));
+            }
+            anyhow::ensure!(ok, "task_cancel works only for tasks you delegated");
+        }
+        self.zeron.cancel_delegated_task(&chat.id).await
+    }
+
     // ---- shared pieces -------------------------------------------------------
 
     /// Prefix the sender's identity when this server speaks for a chat, so
@@ -937,8 +1363,10 @@ impl Tools {
         )
     }
 
-    /// Pick and perform the delivery the composer would.
-    async fn deliver(
+    /// Pick and perform the delivery the composer would, with an optional
+    /// `notify` batch armed on the queued command.
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_notify(
         &self,
         chat: &Chat,
         space: Option<&Space>,
@@ -946,6 +1374,7 @@ impl Tools {
         session: Option<&Session>,
         text: String,
         mode: &str,
+        notify: Option<&str>,
     ) -> anyhow::Result<Value> {
         let harness = chat
             .config
@@ -997,23 +1426,25 @@ impl Tools {
                     worktree: None,
                 };
                 self.zeron
-                    .queue_command(
+                    .queue_command_notify(
                         &chat.id,
                         &SessionCommandPayload::Run {
                             request,
                             message_id: uuid::Uuid::new_v4().to_string(),
                         },
+                        notify,
                     )
                     .await?
             }
             "steer" => {
                 self.zeron
-                    .queue_command(
+                    .queue_command_notify(
                         &chat.id,
                         &SessionCommandPayload::Steer {
                             prompt: text,
                             message_id: Some(uuid::Uuid::new_v4().to_string()),
                         },
+                        notify,
                     )
                     .await?
             }
@@ -1068,6 +1499,16 @@ impl Tools {
     }
 }
 
+/// The engine's arm-side rejection texts need a small MCP-side suffix.
+fn notify_error(err: anyhow::Error) -> anyhow::Error {
+    let text = err.to_string();
+    if text.contains("hosted on this device") {
+        anyhow::anyhow!("{text}; use wait instead")
+    } else {
+        err
+    }
+}
+
 /// claude-code when it is offered here, else the first available harness.
 fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
     if harnesses.is_empty() {
@@ -1096,13 +1537,64 @@ mod tests {
     use std::sync::Mutex;
     use zeron_rpc::{RpcError, RpcReply, RpcService, memory_client, methods};
 
-    /// A fixed little workspace: one device, one project, one chat with a
-    /// two-message transcript. Writes are recorded for assertions.
+    /// A fixed little workspace: one device, one project, a configurable set
+    /// of chat rows, and a two-message transcript. Writes are recorded for
+    /// assertions; `createChat` mirrors the engine's delegation rules.
     #[derive(Default)]
     struct World {
         writes: Mutex<Vec<(String, Value)>>,
         dispatch_barrier: Option<tokio::sync::Barrier>,
+        /// Extra chat rows beyond the default Alpha/Beta pair.
+        extra_chats: Vec<Value>,
+        /// `beta`'s parent; set without `delegation` to make it a side chat.
         beta_parent: Option<String>,
+        /// `beta`'s `delegation` object, when it is a task.
+        beta_delegation: Option<Value>,
+        /// `beta`'s config sandbox (the delegated task's own level).
+        beta_sandbox: Option<&'static str>,
+        sessions: Vec<Value>,
+        delegations: Vec<Value>,
+        /// Canned CancelDelegatedTask reply.
+        cancel_reply: Value,
+    }
+
+    /// The engine's createChat behavior the tools now surface instead of
+    /// checking themselves: delegator rules evaluated against the row.
+    fn create_chat_check(chats: &[Value], params: &Value) -> Option<String> {
+        let by = params["delegatedBy"].as_str()?;
+        let row = chats.iter().find(|c| c["id"].as_str() == Some(by))?;
+        let delegation = row.get("delegation").filter(|d| !d.is_null());
+        match delegation {
+            // A row with a parent and no delegation is a side chat.
+            None if !row.get("parentChatId").is_none_or(Value::is_null) => Some(
+                "Side chats cannot create chats. Ask your parent chat to create another side chat."
+                    .into(),
+            ),
+            None => None,
+            Some(d) => {
+                if d["depth"].as_u64().unwrap_or(0) >= 2 {
+                    return Some("Delegation depth limit reached (2). Do this work yourself, or return the subtasks to your delegator in your final message.".into());
+                }
+                // The sandbox cap: a task's child may not exceed its level.
+                let rank = |s: &str| match s {
+                    "read-only" => 0,
+                    "danger-full-access" => 2,
+                    _ => 1,
+                };
+                let own = row["config"]["sandbox"]
+                    .as_str()
+                    .unwrap_or("workspace-write");
+                let requested = params["config"]["sandbox"]
+                    .as_str()
+                    .unwrap_or("workspace-write");
+                if rank(requested) > rank(own) {
+                    return Some(format!(
+                        "A delegated task cannot create a task with a higher sandbox level than its own. This task is {own} and the request asked for {requested}."
+                    ));
+                }
+                None
+            }
+        }
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1125,21 +1617,27 @@ mod tests {
                     "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
                     "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
                 }])),
-                methods::WATCH_CHATS => stream(json!([
-                    {
-                        "id": "chat-alpha-1", "deviceId": "dev-local", "title": "Alpha",
-                        "archived": false, "spaceId": "space-1",
-                        "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "sandbox": "workspace-write" },
-                        "createdAt": "2026-09-01T00:00:00Z"
-                    },
-                    {
-                        "id": "chat-beta-2", "deviceId": "dev-local", "title": "Beta",
-                        "parentChatId": self.beta_parent,
-                        "archived": false, "spaceId": "space-1",
-                        "createdAt": "2026-09-02T00:00:00Z"
-                    }
-                ])),
-                methods::WATCH_SESSIONS => stream(json!([])),
+                methods::WATCH_CHATS => {
+                    let mut chats = vec![
+                        json!({
+                            "id": "chat-alpha-1", "deviceId": "dev-local", "title": "Alpha",
+                            "archived": false, "spaceId": "space-1",
+                            "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "sandbox": "workspace-write" },
+                            "createdAt": "2026-09-01T00:00:00Z"
+                        }),
+                        json!({
+                            "id": "chat-beta-2", "deviceId": "dev-local", "title": "Beta",
+                            "parentChatId": self.beta_parent,
+                            "delegation": self.beta_delegation,
+                            "archived": false, "spaceId": "space-1",
+                            "config": { "harness": "claude-code", "model": "opus", "reasoning": null, "sandbox": self.beta_sandbox.unwrap_or("workspace-write") },
+                            "createdAt": "2026-09-02T00:00:00Z"
+                        }),
+                    ];
+                    chats.extend(self.extra_chats.iter().cloned());
+                    stream(json!(chats))
+                }
+                methods::WATCH_SESSIONS => stream(json!(self.sessions)),
                 methods::LIST_HARNESSES => RpcReply::Value(json!([
                     { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
                       "steeringMode": "step-boundary", "reasoningLevels": [], "installed": true, "enabled": true },
@@ -1156,7 +1654,28 @@ mod tests {
                       "status": "complete",
                       "parts": [{ "kind": "text", "id": "t", "text": "hello back" }] }
                 ]})),
+                methods::LIST_DELEGATIONS => RpcReply::Value(json!({ "tasks": self.delegations })),
+                methods::CANCEL_DELEGATED_TASK => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params));
+                    RpcReply::Value(self.cancel_reply.clone())
+                }
                 methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
+                    if method == methods::MUTATE
+                        && params["op"].as_str() == Some("createChat")
+                        && let Some(err) = {
+                            let mut chats = vec![
+                                json!({"id":"chat-alpha-1","deviceId":"dev-local","title":"Alpha"}),
+                                json!({"id":"chat-beta-2","deviceId":"dev-local","title":"Beta","parentChatId":self.beta_parent,"delegation":self.beta_delegation,"config":{"sandbox":self.beta_sandbox.unwrap_or("workspace-write")}}),
+                            ];
+                            chats.extend(self.extra_chats.iter().cloned());
+                            create_chat_check(&chats, &params)
+                        }
+                    {
+                        return Err(RpcError::Failed(err));
+                    }
                     self.writes
                         .lock()
                         .unwrap()
@@ -1275,13 +1794,14 @@ mod tests {
         };
         // No mid-turn capability is required for a live mailbox delivery.
         let sent = tools
-            .deliver(
+            .deliver_notify(
                 &chats[0],
                 None,
                 &[],
                 Some(&session),
                 "follow up".into(),
                 "auto",
+                None,
             )
             .await
             .unwrap();
@@ -1330,8 +1850,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_chat_records_the_origin_as_parent() {
-        let world = Arc::new(World::default());
+    async fn create_chat_sends_delegated_by_for_a_calling_chat() {
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            beta_parent: Some("chat-alpha-1".into()),
+            ..Default::default()
+        });
         let tools = tools(
             world.clone(),
             Origin {
@@ -1343,29 +1867,639 @@ mod tests {
             .call("create_chat", json!({ "project": "/repo/comet" }))
             .await
             .unwrap();
-        assert_eq!(created["parentChatId"], "chat-beta-2");
-        assert_eq!(
-            world.writes.lock().unwrap()[0].1["parentChatId"],
-            "chat-beta-2"
-        );
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["delegatedBy"], "chat-beta-2");
+        assert_eq!(created["task"]["delegatedBy"], "chat-beta-2");
+        assert_eq!(created["task"]["depth"], 2);
+        // The task lists under the delegator's root chat.
+        assert_eq!(created["parentChatId"], "chat-alpha-1");
+    }
 
-        // An explicit parent (by title) overrides the origin.
+    #[tokio::test]
+    async fn create_chat_with_notify_arms_and_adds_the_header() {
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            beta_parent: Some("chat-alpha-1".into()),
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
         let created = tools
             .call(
                 "create_chat",
-                json!({ "project": "/repo/comet", "parent": "Alpha" }),
+                json!({ "project": "/repo/comet", "prompt": "do it", "notify": true }),
             )
             .await
             .unwrap();
-        assert_eq!(created["parentChatId"], "chat-alpha-1");
+        let batch = created["task"]["batch"].as_str().unwrap().to_owned();
+        assert_eq!(created["task"]["notify"], true);
+        let writes = world.writes.lock().unwrap();
+        let (method, command) = writes
+            .iter()
+            .find(|(m, _)| m == methods::QUEUE_COMMAND)
+            .expect("an armed run command");
+        assert_eq!(method, methods::QUEUE_COMMAND);
+        assert_eq!(command["notify"]["batch"], batch);
+        let prompt = command["command"]["request"]["prompt"].as_str().unwrap();
+        assert!(
+            prompt.starts_with("[Delegated task from Zeron chat Beta (chat-bet)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with(
+                "
+
+do it"
+            ),
+            "{prompt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_and_wait_cannot_be_combined() {
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
         let err = tools
             .call(
                 "create_chat",
-                json!({ "project": "/repo/comet", "parent": "nope" }),
+                json!({ "project": "/repo/comet", "prompt": "x", "notify": true, "wait": true }),
             )
             .await
             .unwrap_err();
-        assert!(err.contains("no chat matches"), "{err}");
+        assert!(err.contains("notify and wait"), "{err}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_needs_a_prompt_and_a_calling_chat() {
+        let world = Arc::new(World::default());
+        // No origin: probes speak for no chat.
+        let tools1 = tools(world.clone(), Origin::default());
+        let err = tools1
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "prompt": "x", "notify": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("needs a calling chat"), "{err}");
+
+        // With a chat but no prompt.
+        let tools2 = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let err = tools2
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "notify": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("notify needs a prompt"), "{err}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delegated_tasks_can_create_chats_and_forks_cannot() {
+        // beta is a delegated task (delegation set): it may delegate.
+        let task_world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            ..Default::default()
+        });
+        let task = tools(
+            task_world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        assert!(
+            task.call("create_chat", json!({ "project": "/repo/comet" }))
+                .await
+                .is_ok()
+        );
+
+        // beta is a fork (parent, no delegation): the engine's message
+        // surfaces through the tool unchanged.
+        let fork_world = Arc::new(World {
+            beta_parent: Some("chat-alpha-1".into()),
+            ..Default::default()
+        });
+        let side = tools(
+            fork_world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let err = side
+            .call("create_chat", json!({ "project": "/repo/comet" }))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains(
+                "Side chats cannot create chats. Ask your parent chat to create another side chat."
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_engine_depth_error_reaches_the_agent() {
+        // beta is already a depth-2 task: the engine rejects with the
+        // depth message and it reaches the caller as isError text.
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-task-9", "depth": 2 })),
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let err = tools
+            .call("create_chat", json!({ "project": "/repo/comet" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Delegation depth limit reached (2)"), "{err}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_engine_sandbox_error_reaches_the_agent() {
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            beta_sandbox: Some("read-only"),
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let err = tools
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "sandbox": "workspace-write" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("read-only") && err.contains("workspace-write"),
+            "{err}"
+        );
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_task_that_omits_sandbox_defaults_to_its_own_level_at_most() {
+        for (caller_sandbox, sent) in [
+            ("read-only", "read-only"),
+            ("danger-full-access", "workspace-write"),
+        ] {
+            let world = Arc::new(World {
+                beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+                beta_sandbox: Some(caller_sandbox),
+                ..Default::default()
+            });
+            let tools = tools(
+                world.clone(),
+                Origin {
+                    chat_id: Some("chat-beta-2".into()),
+                    device_id: None,
+                },
+            );
+            tools
+                .call("create_chat", json!({ "project": "/repo/comet" }))
+                .await
+                .unwrap();
+            let writes = world.writes.lock().unwrap();
+            assert_eq!(
+                writes[0].1["config"]["sandbox"], sent,
+                "caller {caller_sandbox} defaults to {sent}"
+            );
+        }
+        // A top-level caller keeps workspace-write.
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        tools
+            .call("create_chat", json!({ "project": "/repo/comet" }))
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].1["config"]["sandbox"], "workspace-write");
+        assert_eq!(writes[0].1["delegatedBy"], "chat-alpha-1");
+    }
+
+    #[tokio::test]
+    async fn create_chats_shares_one_batch_across_notify_requests() {
+        let world = Arc::new(World::default());
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let reply = tools
+            .call(
+                "create_chats",
+                json!({ "requests": [
+                    { "project": "/repo/comet", "prompt": "one", "notify": true },
+                    { "project": "/repo/comet", "harness": "not-a-harness", "prompt": "bad", "notify": true },
+                    { "project": "/repo/comet", "prompt": "two", "notify": true },
+                ]}),
+            )
+            .await
+            .unwrap();
+        let results = reply["results"].as_array().unwrap();
+        assert!(results[1]["isError"].as_bool().unwrap(), "{reply}");
+        let batch = reply["batch"].as_str().expect("top-level batch");
+        let writes = world.writes.lock().unwrap();
+        let batches: Vec<_> = writes
+            .iter()
+            .filter(|(m, _)| m == methods::QUEUE_COMMAND)
+            .filter_map(|(_, p)| p["notify"]["batch"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(batches.len(), 2, "the failed request is not armed");
+        assert!(batches.iter().all(|b| b == batch));
+    }
+
+    #[tokio::test]
+    async fn the_live_task_limit_rejects_the_seventeenth_task() {
+        // Sixteen live tasks under the root the caller's tasks list under.
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            beta_parent: Some("chat-alpha-1".into()),
+            extra_chats: (0..16)
+                .map(|i| {
+                    json!({
+                        "id": format!("task-{i}"), "deviceId": "dev-local",
+                        "archived": false,
+                        "delegation": { "by": "chat-alpha-1", "depth": 1 },
+                        "parentChatId": "chat-alpha-1",
+                        "createdAt": "2026-09-03T00:00:00Z"
+                    })
+                })
+                .collect(),
+            sessions: (0..16)
+                .map(|i| {
+                    json!({
+                        "chatId": format!("task-{i}"), "deviceId": "dev-local",
+                        "status": "working", "updatedAt": "2999-01-01T00:00:00Z"
+                    })
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let err = tools
+            .call(
+                "create_chat",
+                json!({ "project": "/repo/comet", "prompt": "seventeenth" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("16 delegated tasks"), "{err}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_message_notify_requires_a_task_you_delegated() {
+        // mine is a task the caller delegated; theirs is someone else's.
+        let world = Arc::new(World {
+            extra_chats: vec![
+                json!({
+                    "id": "chat-task-mine", "deviceId": "dev-local", "title": "Mine", "archived": false,
+                    "delegation": { "by": "chat-alpha-1", "depth": 1 },
+                    "parentChatId": "chat-alpha-1",
+                    "config": { "harness": "claude-code", "sandbox": "workspace-write" },
+                    "createdAt": "2026-09-03T00:00:00Z"
+                }),
+                json!({
+                    "id": "chat-task-other", "deviceId": "dev-local", "title": "Other", "archived": false,
+                    "delegation": { "by": "chat-beta-2", "depth": 1 },
+                    "parentChatId": "chat-alpha-1",
+                    "config": { "harness": "claude-code", "sandbox": "workspace-write" },
+                    "createdAt": "2026-09-03T00:00:00Z"
+                }),
+            ],
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let err = tools
+            .call(
+                "send_message",
+                json!({ "chat": "chat-task-other", "text": "go", "notify": true }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("only for tasks you delegated"), "{err}");
+
+        let sent = tools
+            .call(
+                "send_message",
+                json!({ "chat": "chat-task-mine", "text": "keep going", "notify": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent["task"]["notify"], true);
+        let batch = sent["task"]["batch"].as_str().unwrap().to_owned();
+        let writes = world.writes.lock().unwrap();
+        let command = writes
+            .iter()
+            .find(|(m, _)| m == methods::QUEUE_COMMAND)
+            .unwrap();
+        assert_eq!(command.1["notify"]["batch"], batch);
+    }
+
+    #[tokio::test]
+    async fn send_message_notify_rejects_queue_mode_and_wait() {
+        let world = Arc::new(World {
+            extra_chats: vec![json!({
+                "id": "chat-task-mine", "deviceId": "dev-local", "title": "Mine", "archived": false,
+                "delegation": { "by": "chat-alpha-1", "depth": 1 },
+                "parentChatId": "chat-alpha-1",
+                "config": { "harness": "claude-code", "sandbox": "workspace-write" },
+                "createdAt": "2026-09-03T00:00:00Z"
+            })],
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        for extra in [json!({ "wait": true }), json!({ "mode": "queue" })] {
+            let mut call = json!({ "chat": "chat-task-mine", "text": "x", "notify": true });
+            call.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(tools.call("send_message", call).await.is_err());
+        }
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn task_status_lists_the_tree_with_states() {
+        // alpha's task task-1 is idle with a live grandchild → waitingForTasks.
+        let world = Arc::new(World {
+            extra_chats: vec![
+                json!({
+                    "id": "chat-task-1", "deviceId": "dev-local", "title": "T1", "archived": false,
+                    "delegation": { "by": "chat-alpha-1", "depth": 1 },
+                    "parentChatId": "chat-alpha-1",
+                    "config": { "harness": "claude-code", "model": "opus", "sandbox": "workspace-write" },
+                    "createdAt": "2026-09-03T00:00:00Z"
+                }),
+                json!({
+                    "id": "chat-task-2", "deviceId": "dev-local", "title": "T2", "archived": false,
+                    "delegation": { "by": "chat-task-1", "depth": 2 },
+                    "parentChatId": "chat-alpha-1",
+                    "config": { "harness": "claude-code", "sandbox": "workspace-write" },
+                    "createdAt": "2026-09-04T00:00:00Z"
+                }),
+            ],
+            sessions: vec![json!({
+                "chatId": "chat-task-2", "deviceId": "dev-local",
+                "status": "working", "updatedAt": "2999-01-01T00:00:00Z"
+            })],
+            delegations: vec![
+                json!({ "chatId": "chat-task-1", "delegator": "chat-alpha-1", "batch": "b1", "notice": "armed" }),
+                json!({ "chatId": "chat-task-2", "delegator": "chat-task-1", "batch": "b2", "notice": "armed" }),
+            ],
+            ..Default::default()
+        });
+        let tools = tools(
+            world,
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let listed = tools.call("task_status", json!({})).await.unwrap();
+        let tasks = listed["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        let t1 = &tasks[0];
+        assert_eq!(t1["chatId"], "chat-task-1");
+        assert_eq!(t1["state"], "waitingForTasks");
+        assert_eq!(t1["notice"], "armed");
+        assert_eq!(t1["batch"], "b1");
+        assert_eq!(t1["depth"], 1);
+        let nested = t1["tasks"].as_array().unwrap();
+        assert_eq!(nested[0]["chatId"], "chat-task-2");
+        assert_eq!(nested[0]["state"], "working");
+        assert_eq!(nested[0]["delegatedBy"], "chat-task-1");
+    }
+
+    #[tokio::test]
+    async fn task_status_for_one_task_returns_the_reply() {
+        let world = Arc::new(World {
+            extra_chats: vec![json!({
+                "id": "chat-task-1", "deviceId": "dev-local", "title": "T1", "archived": false,
+                "delegation": { "by": "chat-alpha-1", "depth": 1 },
+                "parentChatId": "chat-alpha-1",
+                "config": { "harness": "claude-code", "sandbox": "workspace-write" },
+                "createdAt": "2026-09-03T00:00:00Z"
+            })],
+            delegations: vec![json!({
+                "chatId": "chat-task-1", "delegator": "chat-alpha-1",
+                "batch": "b1", "notice": "settled", "outcome": "completed"
+            })],
+            ..Default::default()
+        });
+        let tools = tools(
+            world,
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let one = tools
+            .call(
+                "task_status",
+                json!({ "chat": "chat-task-1", "reply_chars": 5 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(one["reply"], "hello");
+        assert_eq!(one["replyTruncated"], true);
+        assert!(one.get("pendingInput").is_some());
+        assert_eq!(one["notice"], "settled");
+        assert_eq!(one["state"], "completed");
+    }
+
+    #[tokio::test]
+    async fn task_cancel_calls_the_engine_and_reports_both_lists() {
+        let world = Arc::new(World {
+            extra_chats: vec![json!({
+                "id": "chat-task-1", "deviceId": "dev-local", "title": "T1", "archived": false,
+                "delegation": { "by": "chat-alpha-1", "depth": 1 },
+                "parentChatId": "chat-alpha-1",
+                "createdAt": "2026-09-03T00:00:00Z"
+            })],
+            cancel_reply: json!({
+                "chatId": "chat-task-1",
+                "interrupted": [{ "chatId": "chat-task-1", "title": "T1", "wasState": "working" }],
+                "notRunning": [],
+            }),
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let result = tools
+            .call("task_cancel", json!({ "chat": "chat-task-1" }))
+            .await
+            .unwrap();
+        assert_eq!(result["interrupted"][0]["wasState"], "working");
+        let writes = world.writes.lock().unwrap();
+        let cancel = writes
+            .iter()
+            .find(|(m, _)| m == methods::CANCEL_DELEGATED_TASK)
+            .expect("one CancelDelegatedTask call");
+        assert_eq!(cancel.1["chatId"], "chat-task-1");
+    }
+
+    #[tokio::test]
+    async fn task_cancel_rejects_a_chat_outside_your_subtree() {
+        let world = Arc::new(World {
+            extra_chats: vec![json!({
+                "id": "chat-task-other", "deviceId": "dev-local", "title": "Other", "archived": false,
+                "delegation": { "by": "chat-beta-2", "depth": 1 },
+                "createdAt": "2026-09-03T00:00:00Z"
+            })],
+            ..Default::default()
+        });
+        let tools = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        let err = tools
+            .call("task_cancel", json!({ "chat": "chat-task-other" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("tasks you delegated"), "{err}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_chats_parent_matches_the_delegator() {
+        // task-1's children have parentChatId == root; a task listing its own
+        // children must match delegation.by.
+        let world = Arc::new(World {
+            extra_chats: vec![
+                json!({
+                    "id": "chat-task-1", "deviceId": "dev-local", "title": "T1", "archived": false,
+                    "delegation": { "by": "chat-alpha-1", "depth": 1 },
+                    "parentChatId": "chat-alpha-1",
+                    "createdAt": "2026-09-03T00:00:00Z"
+                }),
+                json!({
+                    "id": "chat-task-2", "deviceId": "dev-local", "title": "T2", "archived": false,
+                    "delegation": { "by": "chat-task-1", "depth": 2 },
+                    "parentChatId": "chat-alpha-1",
+                    "createdAt": "2026-09-04T00:00:00Z"
+                }),
+            ],
+            ..Default::default()
+        });
+        let tools = tools(world, Origin::default());
+        let listed = tools
+            .call("list_chats", json!({ "parent": "chat-task-1" }))
+            .await
+            .unwrap();
+        let ids: Vec<_> = listed["chats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["chat-task-2"]);
+    }
+
+    #[tokio::test]
+    async fn whoami_reports_delegation() {
+        let world = Arc::new(World {
+            beta_delegation: Some(json!({ "by": "chat-alpha-1", "depth": 1 })),
+            ..Default::default()
+        });
+        let tools1 = tools(
+            world,
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let me = tools1.call("whoami", json!({})).await.unwrap();
+        assert_eq!(me["delegation"]["delegatedBy"], "chat-alpha-1");
+        assert_eq!(me["delegation"]["depth"], 1);
+        assert_eq!(me["delegation"]["maxDepth"], 2);
+        assert_eq!(me["delegation"]["canDelegate"], true);
+
+        // A fork cannot delegate.
+        let world = Arc::new(World {
+            beta_parent: Some("chat-alpha-1".into()),
+            ..Default::default()
+        });
+        let tools2 = tools(
+            world,
+            Origin {
+                chat_id: Some("chat-beta-2".into()),
+                device_id: None,
+            },
+        );
+        let me = tools2.call("whoami", json!({})).await.unwrap();
+        assert_eq!(me["delegation"]["canDelegate"], false);
     }
 
     #[tokio::test]
@@ -1470,48 +2604,6 @@ mod tests {
                 );
             }
         }
-        assert!(world.writes.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn side_chats_cannot_create_chats_or_be_parents() {
-        let world = Arc::new(World {
-            beta_parent: Some("chat-alpha-1".into()),
-            ..Default::default()
-        });
-        let side = tools(
-            world.clone(),
-            Origin {
-                chat_id: Some("chat-beta-2".into()),
-                device_id: None,
-            },
-        );
-        for args in [json!({}), json!({"parent":"Alpha"})] {
-            assert!(
-                side.call("create_chat", args)
-                    .await
-                    .unwrap_err()
-                    .contains("Side chats cannot")
-            );
-        }
-        let batch = side
-            .call("create_chats", json!({"requests":[{}, {"parent":"Alpha"}]}))
-            .await
-            .unwrap();
-        assert!(
-            batch["results"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|r| r["isError"] == true)
-        );
-        let root = tools(world.clone(), Origin::default());
-        assert!(
-            root.call("create_chat", json!({"parent":"Beta"}))
-                .await
-                .unwrap_err()
-                .contains("child of a side chat")
-        );
         assert!(world.writes.lock().unwrap().is_empty());
     }
 
