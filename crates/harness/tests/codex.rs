@@ -360,6 +360,64 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
 }
 
 #[tokio::test]
+async fn async_user_input_routes_through_request_input_and_steers_the_answer() {
+    let asked_questions = Arc::new(Mutex::new(Vec::<UserInputQuestion>::new()));
+    let (_steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let asked = asked_questions.clone();
+    let controls = RunControls {
+        execution_lease: None,
+        request_input: Box::new(move |questions| {
+            asked.lock().unwrap().extend(questions.iter().cloned());
+            let (tx, rx) = oneshot::channel();
+            let answers: Vec<UserInputAnswer> = questions
+                .iter()
+                .map(|q| UserInputAnswer {
+                    question_id: q.id.clone(),
+                    labels: vec!["mcp".into()],
+                })
+                .collect();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let events = run_to_end(&harness(), request("scenario:async-input"), controls).await;
+    {
+        let asked = asked_questions.lock().unwrap();
+        let asked = asked
+            .first()
+            .expect("the async question reached request_input");
+        assert_eq!(asked.question, "mcp or harness?");
+        assert_eq!(asked.options, vec!["mcp", "harness"]);
+        assert_eq!(asked.id, "m9-q0");
+    }
+    // The answer went back as a steer and the turn completed with its text.
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. })),
+        "the answer was delivered as a steer"
+    );
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("chose mcp"), "{text}");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
 async fn steering_uses_turn_steer_with_expected_turn_id() {
     let (controls, steer, _token) = controls("Yes");
     steer
