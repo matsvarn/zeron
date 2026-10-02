@@ -951,7 +951,22 @@ impl DelegationEngine {
                     IdleVerdict::Settled(Outcome::Completed)
                 }
             }
-            _ => IdleVerdict::Owed, // mid-flight residue (Streaming)
+            Some(entry) if entry.status == Some(MessageStatus::Streaming) => {
+                // Residue of a turn that died mid-stream: the journal got
+                // its Done (graceful quit) but the doc entry was never
+                // stamped, or the process crashed between the two writes. A
+                // live streaming turn has a registered run (and a revived
+                // crash reads as reviving until it re-dispatches); without
+                // either the stream is orphaned and the result is the
+                // partial output.
+                if self.inner.sessions.run_registered(&task.chat_id)
+                    || self.inner.sessions.is_reviving(&task.chat_id)
+                {
+                    return IdleVerdict::Owed;
+                }
+                IdleVerdict::Settled(Outcome::Interrupted)
+            }
+            _ => IdleVerdict::Owed,
         }
     }
 

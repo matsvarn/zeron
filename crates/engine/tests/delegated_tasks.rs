@@ -1341,22 +1341,6 @@ async fn a_task_waiting_for_input_sends_one_attention_notice_and_stays_armed() {
         "the task to park on its question",
     )
     .await;
-    eprintln!(
-        "ENTRIES: {:?}",
-        entries(&core, "task-1")
-            .iter()
-            .map(|e| (
-                &e.id,
-                &e.role,
-                &e.status,
-                e.parts
-                    .iter()
-                    .map(|p| p.id().to_string())
-                    .collect::<Vec<_>>()
-            ))
-            .collect::<Vec<_>>()
-    );
-    eprintln!("LEDGER: {:?}", ledger(&core));
     wait_for(|| notices(&core, "root").len() == 1, "the attention notice").await;
     let notice = &notices(&core, "root")[0];
     assert!(notice.contains("pick a color"));
@@ -3669,4 +3653,102 @@ async fn a_late_member_of_a_released_batch_gets_its_own_notice() {
     assert_eq!(notices(&core, "root").len(), 2);
     wait_for(|| ledger(&core).is_empty(), "the second batch clears").await;
     core.shutdown().await;
+}
+
+/// REGRESSION: a graceful app quit wrote the journal's Done{interrupted} but
+/// the doc's streaming assistant entry was never stamped — the journal ends
+/// with Done so boot recovery skips the chat, and the entry stays Streaming
+/// forever. Idle + orphaned streaming entry + no live run settled NOTHING —
+/// the task was owed forever (live evidence: pi chat c1cbd5f0 slept 1200,
+/// Cmd-Q killed it, and the ledger kept settled=null for minutes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_streaming_entry_settles_interrupted() {
+    let (_dir, core, _harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    let doc = core.doc_host.open("task-1").unwrap();
+    doc.doc()
+        .push_message(&message(
+            "m-task-1",
+            MessageRole::User,
+            "job",
+            MessageStatus::Complete,
+        ))
+        .unwrap();
+    // The turn was cut mid-stream: an assistant entry still marked Streaming,
+    // its journal already closed with done{interrupted}.
+    doc.doc()
+        .push_message(&message(
+            "a-task-1",
+            MessageRole::Assistant,
+            "partial",
+            MessageStatus::Streaming,
+        ))
+        .unwrap();
+    core.delegation.arm("task-1", "b1", "m-task-1").unwrap();
+    core.delegation.seal_batch("root", "b1").await;
+    core.delegation.run_pass().await;
+    wait_for(|| ledger(&core).is_empty(), "the orphaned turn settles").await;
+    let notice = notices(&core, "root");
+    assert_eq!(notice.len(), 1);
+    assert!(notice[0].contains("interrupted"), "{}", notice[0]);
+    assert!(notice[0].contains("partial"), "{}", notice[0]);
+    core.shutdown().await;
+}
+
+/// A crashed engine revives the task's turn instead of settling it: the
+/// armed task must stay Owed through the revival (Streaming residue +
+/// is_reviving), and the revived run's own turn completes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crashed_turn_revives_and_completes() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    let device_id = core.device_id.clone();
+    core.shutdown().await;
+    drop(core);
+    // kill -9 mid-turn: an open-ended journal + a Streaming assistant entry
+    // fresh enough to resume.
+    plant_crash(dir.path(), "task-1", &device_id, /* fresh = */ true);
+
+    let harness2 = Held::new(SteeringMode::StepBoundary);
+    let core2 = assemble_at(dir.path(), harness2.clone());
+    core2.sessions.set_ipc_port(27656);
+    // Boot recovery re-dispatches the turn: the task must stay armed — a
+    // settle here would report interrupted for a run that is still alive.
+    // The stub keys runs by request.mcp's ZERON_CHAT_ID, and the revival
+    // request carries none — a revived turn registers as "". Recovery's
+    // resume runs through several async hops, so give it a wide window.
+    let dl = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < dl
+        && harness2.runs_for("").is_empty()
+        && harness2.runs_for("task-1").is_empty()
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let revived_key = if !harness2.runs_for("").is_empty() {
+        ""
+    } else {
+        "task-1"
+    };
+    assert!(
+        !harness2.runs_for(revived_key).is_empty(),
+        "no revived run appeared"
+    );
+    let rows = ledger(&core2);
+    assert!(
+        rows.iter()
+            .any(|(id, _, settled)| id == "task-1" && !settled),
+        "the revived turn must stay armed, got {rows:?}"
+    );
+    harness2.finish(revived_key, Finish::Complete("RESULT".into()));
+    wait_for(|| ledger(&core2).is_empty(), "the revived task releases").await;
+    let notice = notices(&core2, "root");
+    assert_eq!(notice.len(), 1);
+    assert!(notice[0].contains("completed"), "{}", notice[0]);
+    assert!(notice[0].contains("RESULT"), "{}", notice[0]);
+    core2.shutdown().await;
 }
