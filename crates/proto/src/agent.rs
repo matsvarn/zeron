@@ -580,6 +580,15 @@ pub enum AgentEvent {
     InputResolved {
         request_id: String,
     },
+    /// Background shell work a harness runs outside the turn (claude-code's
+    /// `run_in_background` Bash tasks): `pending` is the count still open.
+    /// Emitted whenever the count changes; the engine holds a delegated
+    /// task's settle until it reaches zero.
+    #[serde(rename_all = "camelCase")]
+    BackgroundWork {
+        #[serde(default)]
+        pending: u32,
+    },
     /// A confirmed new assignment. When tagged as Subagent, this reopens the
     /// same child transcript even if the provider does not echo the user text.
     #[serde(rename_all = "camelCase")]

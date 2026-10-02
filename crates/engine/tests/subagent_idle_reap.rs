@@ -243,6 +243,62 @@ async fn park_after_spawn() -> Parked {
 /// The subagent keeps working for several idle windows, then finishes. It
 /// must finish `Done`, not be reaped mid-flight as `Failed`; once it settles,
 /// the parked session is reaped as usual, counted from its last activity.
+/// A parked session holding an open background shell (claude
+/// `run_in_background`) is not reaped inside the normal idle window — its
+/// deadline stretches like a live subagent's. Once the count reaches zero
+/// the ordinary window applies again.
+#[tokio::test]
+async fn reaper_spares_a_parked_session_with_background_work() {
+    init_env();
+    let (feed, rx) = mpsc::unbounded_channel();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(FeedHarness {
+        main_prompt: "fan out".into(),
+        feed: Mutex::new(Some(rx)),
+    }));
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(dir.path(), Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles");
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("fan out"), None)
+        .await
+        .expect("dispatch");
+    feed.send(AgentEvent::SessionStarted {
+        harness: HarnessId::Mock,
+        model: "mock-1".into(),
+        tools: vec![],
+        cwd: "/tmp".into(),
+        session_id: "hs-r".into(),
+        assistant_message_id: "a-r".into(),
+    })
+    .unwrap();
+    feed.send(AgentEvent::BackgroundWork { pending: 1 })
+        .unwrap();
+    feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "park after Done",
+    )
+    .await;
+
+    // Well past the ordinary idle window the warm child must still be there.
+    tokio::time::sleep(Duration::from_millis(IDLE_MS * 4)).await;
+    assert!(
+        !feed.is_closed(),
+        "the idle reaper killed a session with background work open"
+    );
+
+    // Work finished: the ordinary window reaps it.
+    feed.send(AgentEvent::BackgroundWork { pending: 0 })
+        .unwrap();
+    wait_for(|| feed.is_closed(), "reap once background work settled").await;
+    core.sessions.shutdown().await;
+}
+
 #[tokio::test]
 async fn reaper_spares_a_parked_session_with_a_live_subagent() {
     let Parked { core, feed, _dir } = park_after_spawn().await;

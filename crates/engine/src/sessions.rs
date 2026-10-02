@@ -104,6 +104,19 @@ impl RuntimeConfig {
     }
 }
 
+/// In-flight background harness work for one chat. `abandoned` means the
+/// process ended while work was still open — the wake turn can never come.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackgroundState {
+    pub pending: u32,
+    /// Set when the run ended with work still open; the settle verdict then
+    /// reads `interrupted`, not `completed`.
+    pub abandoned: bool,
+    /// Set when the count drops from >0 to 0: the CLI's own wake turn is
+    /// about to run — do not settle on the pre-wake "waiting" reply.
+    pub wake_pending: bool,
+}
+
 struct RunHandle {
     run_id: String,
     steerable: bool,
@@ -175,6 +188,10 @@ struct Inner {
     /// briefly Idle between `recover_stale`'s stamp and the revived run's
     /// Working, and a settle observer must not read that window as "ended".
     reviving: Mutex<std::collections::HashSet<String>>,
+    /// Background harness work outside the turn (claude `run_in_background`
+    /// shells): open count, and whether it was abandoned (process ended,
+    /// reaped, or interrupted with work still open).
+    background: Mutex<std::collections::HashMap<String, BackgroundState>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -213,6 +230,7 @@ impl SessionsEngine {
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 reviving: Mutex::new(std::collections::HashSet::new()),
+                background: Mutex::new(std::collections::HashMap::new()),
             }),
         }
     }
@@ -284,6 +302,15 @@ impl SessionsEngine {
 
     /// A crash-recovery re-dispatch is in flight for this chat: its status
     /// reads Idle for a moment, but its turn is starting over, not over.
+    /// Open background-shell work for a chat (delegation holds a task's
+    /// settle on it).
+    pub fn background_state(&self, chat_id: &str) -> BackgroundState {
+        lock(&self.inner.background)
+            .get(chat_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub fn is_reviving(&self, chat_id: &str) -> bool {
         lock(&self.inner.reviving).contains(chat_id)
     }
@@ -599,6 +626,7 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
         };
 
+        lock(&self.inner.background).insert(chat_id.to_string(), BackgroundState::default());
         lock(&self.inner.runs).insert(
             chat_id.to_string(),
             RunHandle {
@@ -1006,6 +1034,13 @@ impl SessionsEngine {
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
+        if status == SessionStatus::Working {
+            // A live run means any expected background wake arrived; clear
+            // the settle guard so the turn's Done may settle the task.
+            if let Some(state) = lock(&self.inner.background).get_mut(chat_id) {
+                state.wake_pending = false;
+            }
+        }
         self.inner.set_status(chat_id, status, fresh_start);
     }
 }
@@ -1143,6 +1178,13 @@ impl Inner {
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
+        if status == SessionStatus::Working {
+            // A live run means any expected background wake arrived; clear
+            // the settle guard so the turn's Done may settle the task.
+            if let Some(state) = lock(&self.background).get_mut(chat_id) {
+                state.wake_pending = false;
+            }
+        }
         self.set_status_with_completion(chat_id, status, fresh_start, None);
     }
 
@@ -2145,8 +2187,11 @@ async fn drive_run(
                 _ = tokio::time::sleep_until(
                     idle_since
                         .map(|at| {
+                            let background_open = lock(&inner.background)
+                                .get(&chat_id)
+                                .is_some_and(|b| b.pending > 0);
                             at.max(last_subagent_activity.unwrap_or(at))
-                                + if subagents.is_empty() { session_idle } else { subagent_silence }
+                                + if subagents.is_empty() && !background_open { session_idle } else { subagent_silence }
                         })
                         .unwrap_or_else(tokio::time::Instant::now)
                 ), if idle_since.is_some() => {
@@ -2497,6 +2542,20 @@ async fn drive_run(
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
                 tracing::warn!(%chat_id, error = %err, "context usage write failed");
+            }
+            continue;
+        }
+        // Background shell count (claude run_in_background): update the
+        // ledger even while parked — the notification arrives between turns.
+        // A drop to zero means the CLI's wake turn is about to start; the
+        // settle watcher gets a tick via the touch above.
+        if let AgentEvent::BackgroundWork { pending } = &event {
+            let mut map = lock(&inner.background);
+            let state = map.entry(chat_id.clone()).or_default();
+            let had = state.pending;
+            state.pending = *pending;
+            if had > 0 && *pending == 0 {
+                state.wake_pending = true;
             }
             continue;
         }
@@ -2904,6 +2963,16 @@ async fn drive_run(
         .filter(|h| h.run_id == run_id)
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
+    {
+        // Process end, reaper, or interrupt with background work still open:
+        // no wake turn can arrive — the task must settle interrupted.
+        let mut map = lock(&inner.background);
+        let state = map.entry(chat_id.clone()).or_default();
+        if state.pending > 0 {
+            state.pending = 0;
+            state.abandoned = true;
+        }
+    }
     inner.remove_run(&chat_id, &run_id);
     inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
     if !interrupted && !orphans.is_empty() {

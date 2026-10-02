@@ -4,7 +4,7 @@
 use serde_json::Value;
 use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
 
-use super::wire::{ContentBlock, Frame};
+use super::wire::{ContentBlock, Frame, SystemFrame};
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -201,6 +201,12 @@ pub(crate) struct Normalizer {
     /// which then opened as an empty, never-created subagent doc (user
     /// report 2026-08-20).
     agent_spawn_tools: std::collections::HashSet<String>,
+    /// Backgrounded `Bash` calls (run_in_background): tool_use ids still
+    /// running, plus task_id → tool_use_id learned from `task_started`.
+    background_shells: std::collections::HashSet<String>,
+    background_shell_tasks: std::collections::HashMap<String, String>,
+    /// Open background shells; emitted as `BackgroundWork` on every change.
+    background_pending: u32,
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
@@ -216,6 +222,9 @@ impl Normalizer {
             agent_tasks: std::collections::HashMap::new(),
             agent_tool_spawns: std::collections::HashMap::new(),
             agent_spawn_tools: std::collections::HashSet::new(),
+            background_shells: std::collections::HashSet::new(),
+            background_shell_tasks: std::collections::HashMap::new(),
+            background_pending: 0,
             assistant_message_id: new_message_id(),
             session_id: None,
         }
@@ -324,6 +333,29 @@ impl Normalizer {
         norm
     }
 
+    /// The Bash tool_use id this task_notification settles, if it names a
+    /// known background shell: direct `tool_use_id`, else `task_id` mapped
+    /// at `task_started`.
+    fn bg_shell_key<'a>(&'a self, f: &'a SystemFrame) -> Option<&'a str> {
+        f.task_id
+            .as_deref()
+            .and_then(|task| self.background_shell_tasks.get(task))
+            .map(String::as_str)
+            .or_else(|| {
+                f.tool_use_id
+                    .as_deref()
+                    .filter(|id| self.background_shells.contains(*id))
+            })
+    }
+
+    /// The pending count after a change, as the engine event.
+    fn background_work(&mut self, delta: i32) -> AgentEvent {
+        self.background_pending = self.background_pending.saturating_add_signed(delta);
+        AgentEvent::BackgroundWork {
+            pending: self.background_pending,
+        }
+    }
+
     /// Rotate the assistant message id for a steer boundary; returns
     /// (previous, next) for the `Steered` event.
     pub fn rotate_for_steer(&mut self) -> (String, String) {
@@ -343,6 +375,18 @@ impl Normalizer {
                 // Surface it as the subagent's tagged Done so the chip flips
                 // done/failed and the transcript freezes.
                 if f.subtype == "task_notification" {
+                    // A background SHELL task's notification keys on the
+                    // Bash call's `tool_use_id`, or on the shell task's own
+                    // `task_id` learned at `task_started` — accept both,
+                    // before the agent path drops unmapped notifications.
+                    let shell = self.bg_shell_key(&f).map(str::to_owned);
+                    if let Some(shell) = shell {
+                        self.background_shells.remove(&shell);
+                        if let Some(task) = &f.task_id {
+                            self.background_shell_tasks.remove(task);
+                        }
+                        return vec![self.background_work(-1)];
+                    }
                     // A resumed task's notification may carry SendMessage's
                     // id, or omit the tool id entirely. Its task id is stable.
                     let parent = f
@@ -398,6 +442,20 @@ impl Normalizer {
                     self.agent_spawn_tools.insert(spawn.clone());
                     self.agent_tool_spawns
                         .insert(tool.to_owned(), spawn.clone());
+                    return Vec::new();
+                }
+                // A background SHELL task starting: same subtype without a
+                // subagent_type. Learn task_id → Bash tool_use id so its
+                // `task_notification` resolves whichever key it carries.
+                if f.subtype == "task_started"
+                    && let (Some(task), Some(tool)) = (
+                        f.task_id.as_deref().filter(|t| !t.is_empty()),
+                        f.tool_use_id.as_deref().filter(|t| !t.is_empty()),
+                    )
+                    && self.background_shells.contains(tool)
+                {
+                    self.background_shell_tasks
+                        .insert(task.to_owned(), tool.to_owned());
                     return Vec::new();
                 }
                 if f.subtype != "init" || self.saw_init {
@@ -511,6 +569,22 @@ impl Normalizer {
                         self.agent_spawn_tools.insert(b.id.clone());
                     }
                 }
+                // A Bash call flagged run_in_background keeps running past
+                // the turn's Done — the delegation engine must hold the task
+                // open until its task_notification lands.
+                let mut background: Vec<AgentEvent> = Vec::new();
+                for b in f.message.blocks() {
+                    if b.kind == "tool_use"
+                        && b.name == "Bash"
+                        && b.input
+                            .get("run_in_background")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        && self.background_shells.insert(b.id.clone())
+                    {
+                        background.push(self.background_work(1));
+                    }
+                }
                 let mut out: Vec<AgentEvent> = f
                     .message
                     .blocks()
@@ -593,6 +667,7 @@ impl Normalizer {
                         message: assistant_error_text(code),
                     });
                 }
+                out.extend(background);
                 // The enclosing assistant frame closes the streamed message
                 // item; rotate so post-boundary deltas get a fresh id.
                 let (prev, _next) = self.rotate_for_steer();
@@ -869,6 +944,105 @@ mod tests {
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"signature_delta","signature":"abc"}}}"#,
         );
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn a_backgrounded_bash_counts_pending_until_its_notification() {
+        let mut norm = Normalizer::new();
+        let bash = |norm: &mut Normalizer| {
+            let frame = crate::claude::wire::parse_frame(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_sleep","name":"Bash","input":{"command":"sleep 60","run_in_background":true}}]}}"#,
+            )
+            .expect("parses");
+            norm.normalize(frame, false)
+        };
+        let ev = bash(&mut norm);
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, AgentEvent::BackgroundWork { pending: 1 }))
+        );
+        // The shell's notification keys on the Bash call's tool_use_id —
+        // it emits a BackgroundWork drop, never a subagent Done.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"shelltask1","tool_use_id":"toolu_sleep","status":"completed","summary":"done"}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(frame, false);
+        assert_eq!(ev, vec![AgentEvent::BackgroundWork { pending: 0 }]);
+    }
+
+    #[test]
+    fn a_foreground_bash_never_counts() {
+        let mut norm = Normalizer::new();
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls"}}]}}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(frame, false);
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, AgentEvent::BackgroundWork { .. }))
+        );
+        // A notification naming it settles nothing.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","tool_use_id":"toolu_bash","status":"completed"}"#,
+        )
+        .expect("parses");
+        assert!(norm.normalize(frame, false).is_empty());
+    }
+
+    #[test]
+    fn a_shell_task_started_keys_its_notification_by_task_id() {
+        let mut norm = Normalizer::new();
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_sleep","name":"Bash","input":{"command":"sleep 60","run_in_background":true}}]}}"#,
+        )
+        .expect("parses");
+        norm.normalize(frame, false);
+        // Shell task_started: same subtype, NO subagent_type.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_started","task_id":"sh-9","tool_use_id":"toolu_sleep"}"#,
+        )
+        .expect("parses");
+        norm.normalize(frame, false);
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"sh-9","status":"completed"}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            norm.normalize(frame, false),
+            vec![AgentEvent::BackgroundWork { pending: 0 }]
+        );
+    }
+
+    #[test]
+    fn an_agent_notification_settles_the_subagent_not_the_shell_count() {
+        let mut norm = Normalizer::new();
+        // One background shell plus one spawned agent.
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"toolu_sleep","name":"Bash","input":{"command":"sleep 60","run_in_background":true}},
+                {"type":"tool_use","id":"toolu_agent","name":"Agent","input":{"description":"probe"}}
+            ]}}"#,
+        )
+        .expect("parses");
+        norm.normalize(frame, false);
+        let frame = crate::claude::wire::parse_frame(
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_agent","status":"completed"}"#,
+        )
+        .expect("parses");
+        let ev = norm.normalize(frame, false);
+        assert!(matches!(
+            &ev[..],
+            [AgentEvent::Subagent { parent_tool_use_id, event }]
+                if parent_tool_use_id == "toolu_agent"
+                    && matches!(event.as_ref(), AgentEvent::Done { .. })
+        ));
+        // The shell is still open: no BackgroundWork{0} emitted.
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, AgentEvent::BackgroundWork { .. }))
+        );
     }
 
     #[test]
@@ -1290,7 +1464,11 @@ mod tests {
             r#"{"type":"system","subtype":"task_notification","task_id":"bg1","tool_use_id":"toolu_bash","status":"completed"}"#,
         )
         .expect("parses");
-        assert!(norm.normalize(done, false).is_empty());
+        // No subagent Done — just the background-work ledger dropping to 0.
+        assert_eq!(
+            norm.normalize(done, false),
+            vec![AgentEvent::BackgroundWork { pending: 0 }]
+        );
     }
 
     #[test]

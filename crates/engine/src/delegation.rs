@@ -748,6 +748,14 @@ impl DelegationEngine {
         if pending_commands {
             return IdleVerdict::TurnStarting;
         }
+        // Background shells (claude `run_in_background`) keep the task's real
+        // answer outstanding past the turn end: hold the settle until they
+        // finish and the CLI's wake turn lands. A count dropping to zero
+        // still waits — the wake turn must write the result first.
+        let background = self.inner.sessions.background_state(&task.chat_id);
+        if background.pending > 0 || background.wake_pending {
+            return IdleVerdict::Owed;
+        }
         match after
             .iter()
             .rev()
@@ -763,6 +771,12 @@ impl DelegationEngine {
                 }
             }
             Some(entry) if entry.status == Some(MessageStatus::Complete) => {
+                // The harness process ended with background shells still
+                // open (reaped, crashed, interrupted): no wake turn can
+                // deliver the real result, so this is interrupted.
+                if background.abandoned {
+                    return IdleVerdict::Settled(Outcome::Interrupted);
+                }
                 let Ok(queue) = handle.doc().read_queue() else {
                     return IdleVerdict::Owed;
                 };

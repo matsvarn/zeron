@@ -22,6 +22,17 @@ enum Finish {
     Complete(String),
     Errored(String),
     Question(Vec<UserInputQuestion>),
+    /// Turn ends "completed" while a background shell still runs: the stub
+    /// emits the reply, `BackgroundWork { pending: 1 }`, and Done — then
+    /// stays alive, like the claude CLI waiting for its own notification.
+    CompleteWithBackground(String),
+    /// Just the background-work count event — the turn keeps running.
+    Background(u32),
+    /// The background task's notification arrived: pending drops to zero
+    /// and the CLI's own wake turn replies (one process, second turn).
+    Wake(String),
+    /// The harness process dies with background work still open.
+    Die,
 }
 
 /// Per-chat controllable stub: records every run request and steer keyed by
@@ -161,6 +172,22 @@ impl Harness for Held {
                                 send(done(DoneStatus::Completed, None));
                                 break;
                             }
+                            Some(Finish::CompleteWithBackground(text)) => {
+                                send(AgentEvent::TextDelta { text });
+                                send(AgentEvent::BackgroundWork { pending: 1 });
+                                send(done(DoneStatus::Completed, None));
+                                // Not a break: the process lives, parked.
+                            }
+                            Some(Finish::Wake(text)) => {
+                                send(AgentEvent::BackgroundWork { pending: 0 });
+                                send(AgentEvent::TextDelta { text });
+                                send(done(DoneStatus::Completed, None));
+                                break;
+                            }
+                            Some(Finish::Background(pending)) => {
+                                send(AgentEvent::BackgroundWork { pending });
+                            }
+                            Some(Finish::Die) => break,
                             Some(Finish::Errored(error)) => {
                                 send(done(DoneStatus::Errored, Some(error)));
                                 break;
@@ -2849,5 +2876,104 @@ async fn seal_survives_a_restart() {
     let core = assemble_at(dir.path(), harness.clone());
     core.sessions.set_ipc_port(27655);
     wait_for(|| notices(&core, "root").len() == 1, "boot pass releases").await;
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_with_background_work_reports_after_the_wake_turn() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish(
+        "task-1",
+        Finish::CompleteWithBackground("waiting for the sleep".into()),
+    );
+    wait_for(
+        || {
+            core.sessions
+                .session_status("task-1")
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::Idle)
+        },
+        "the parked turn",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        notices(&core, "root").is_empty(),
+        "a turn ending with background work open sends no notice"
+    );
+
+    // The CLI's wake turn: pending drops to zero and the task replies for
+    // real (drive_run's resume gate keeps events inside the first second
+    // inert, so wait past it before the notification lands).
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    harness.finish("task-1", Finish::Wake("WAKE-1".into()));
+    wait_for(|| notices(&core, "root").len() == 1, "the wake-turn notice").await;
+    let notice = &notices(&core, "root")[0];
+    assert!(notice.contains("WAKE-1"), "{notice}");
+    assert!(!notice.contains("waiting for the sleep"), "{notice}");
+    assert!(ledger(&core).is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_task_with_background_work_reports_interrupted() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    // Interrupt MID-TURN while a background shell is open.
+    harness.finish("task-1", Finish::Background(1));
+    wait_for(
+        || core.sessions.background_state("task-1").pending == 1,
+        "the open background shell",
+    )
+    .await;
+    queue_command(&client, "task-1", SessionCommandPayload::Interrupt {}, None)
+        .await
+        .unwrap();
+    wait_for(
+        || notices(&core, "root").len() == 1,
+        "the interrupted notice",
+    )
+    .await;
+    assert!(notices(&core, "root")[0].contains(": interrupted"));
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reaped_or_crashed_background_task_settles_interrupted() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish(
+        "task-1",
+        Finish::CompleteWithBackground("waiting for the sleep".into()),
+    );
+    wait_for(
+        || {
+            core.sessions
+                .session_status("task-1")
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::Idle)
+        },
+        "the parked turn",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(notices(&core, "root").is_empty());
+    // The process dies with the shell still running: no wake turn can come.
+    harness.finish("task-1", Finish::Die);
+    wait_for(
+        || notices(&core, "root").len() == 1,
+        "the interrupted notice",
+    )
+    .await;
+    assert!(
+        notices(&core, "root")[0].contains(": interrupted"),
+        "{:?}",
+        notices(&core, "root")[0]
+    );
     core.shutdown().await;
 }
