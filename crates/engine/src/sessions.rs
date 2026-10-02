@@ -114,8 +114,17 @@ pub struct BackgroundState {
     pub abandoned: bool,
     /// Set when the count drops from >0 to 0: the CLI's own wake turn is
     /// about to run — do not settle on the pre-wake "waiting" reply.
+    /// Bounded by `wake_due_at`: a CLI that never wakes must not strand the
+    /// task Owed forever.
     pub wake_pending: bool,
+    /// When `wake_pending` lapses; `background_state` reports a deadline-aware
+    /// view, so this is always the raw ledger field.
+    wake_due_at: Option<tokio::time::Instant>,
 }
+
+/// Default grace between "last background shell finished" and giving up on
+/// the CLI's self-invoked wake turn.
+const WAKE_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
 struct RunHandle {
     run_id: String,
@@ -192,6 +201,8 @@ struct Inner {
     /// shells): open count, and whether it was abandoned (process ended,
     /// reaped, or interrupted with work still open).
     background: Mutex<std::collections::HashMap<String, BackgroundState>>,
+    /// Injectable `WAKE_WINDOW` for tests.
+    wake_timeout: Mutex<std::time::Duration>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -231,6 +242,7 @@ impl SessionsEngine {
                 turn_listener: OnceLock::new(),
                 reviving: Mutex::new(std::collections::HashSet::new()),
                 background: Mutex::new(std::collections::HashMap::new()),
+                wake_timeout: Mutex::new(WAKE_WINDOW),
             }),
         }
     }
@@ -300,17 +312,33 @@ impl SessionsEngine {
         self.inner.sessions_tx.subscribe()
     }
 
-    /// A crash-recovery re-dispatch is in flight for this chat: its status
-    /// reads Idle for a moment, but its turn is starting over, not over.
     /// Open background-shell work for a chat (delegation holds a task's
-    /// settle on it).
+    /// settle on it). A lapsed `wake_pending` reads as cleared — the CLI's
+    /// wake turn never came and the pre-wake reply is all there is.
     pub fn background_state(&self, chat_id: &str) -> BackgroundState {
-        lock(&self.inner.background)
-            .get(chat_id)
-            .copied()
-            .unwrap_or_default()
+        let mut map = lock(&self.inner.background);
+        let mut state = map.get(chat_id).copied().unwrap_or_default();
+        if state.wake_pending
+            && state
+                .wake_due_at
+                .is_some_and(|at| tokio::time::Instant::now() >= at)
+        {
+            state.wake_pending = false;
+            if let Some(live) = map.get_mut(chat_id) {
+                live.wake_pending = false;
+            }
+        }
+        state
     }
 
+    /// `WAKE_WINDOW` override for tests.
+    #[doc(hidden)]
+    pub fn set_wake_timeout(&self, timeout: std::time::Duration) {
+        *lock(&self.inner.wake_timeout) = timeout;
+    }
+
+    /// A crash-recovery re-dispatch is in flight for this chat: its status
+    /// reads Idle for a moment, but its turn is starting over, not over.
     pub fn is_reviving(&self, chat_id: &str) -> bool {
         lock(&self.inner.reviving).contains(chat_id)
     }
@@ -2556,6 +2584,7 @@ async fn drive_run(
             state.pending = *pending;
             if had > 0 && *pending == 0 {
                 state.wake_pending = true;
+                state.wake_due_at = Some(tokio::time::Instant::now() + *lock(&inner.wake_timeout));
             }
             continue;
         }
@@ -2968,8 +2997,9 @@ async fn drive_run(
         // no wake turn can arrive — the task must settle interrupted.
         let mut map = lock(&inner.background);
         let state = map.entry(chat_id.clone()).or_default();
-        if state.pending > 0 {
+        if state.pending > 0 || state.wake_pending {
             state.pending = 0;
+            state.wake_pending = false;
             state.abandoned = true;
         }
     }

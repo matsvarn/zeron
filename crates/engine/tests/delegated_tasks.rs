@@ -2977,3 +2977,79 @@ async fn a_reaped_or_crashed_background_task_settles_interrupted() {
     );
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_wake_turn_settles_after_the_deadline() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    // Injectable WAKE_WINDOW: the CLI never wakes within this window.
+    core.sessions.set_wake_timeout(Duration::from_millis(400));
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish(
+        "task-1",
+        Finish::CompleteWithBackground("waiting for the sleep".into()),
+    );
+    wait_for(
+        || {
+            core.sessions
+                .session_status("task-1")
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::Idle)
+        },
+        "the parked turn",
+    )
+    .await;
+    // The shell finishes — but no wake turn ever follows. The deadline must
+    // unblock the settle rather than stranding the task Owed.
+    harness.finish("task-1", Finish::Background(0));
+    wait_for(
+        || notices(&core, "root").len() == 1,
+        "the settle after the wake deadline",
+    )
+    .await;
+    let notice = &notices(&core, "root")[0];
+    assert!(notice.contains(": completed"), "{notice}");
+    assert!(notice.contains("waiting for the sleep"), "{notice}");
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_end_while_waiting_for_the_wake_settles_interrupted() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish(
+        "task-1",
+        Finish::CompleteWithBackground("waiting for the sleep".into()),
+    );
+    wait_for(
+        || {
+            core.sessions
+                .session_status("task-1")
+                .is_some_and(|s| s.status == zeron_proto::SessionStatus::Idle)
+        },
+        "the parked turn",
+    )
+    .await;
+    harness.finish("task-1", Finish::Background(0));
+    wait_for(
+        || core.sessions.background_state("task-1").wake_pending,
+        "waiting on the wake turn",
+    )
+    .await;
+    // The process dies before the wake turn runs: interrupted, not
+    // completed-with-the-pre-wake-text.
+    harness.finish("task-1", Finish::Die);
+    wait_for(
+        || notices(&core, "root").len() == 1,
+        "the interrupted notice",
+    )
+    .await;
+    assert!(
+        notices(&core, "root")[0].contains(": interrupted"),
+        "{:?}",
+        notices(&core, "root")[0]
+    );
+    core.shutdown().await;
+}
