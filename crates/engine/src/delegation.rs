@@ -136,6 +136,10 @@ struct Inner {
     ledger: Mutex<Ledger>,
     /// Chats with a deferred recheck in flight — at most one each.
     scheduled: Mutex<HashMap<String, (Instant, u8)>>,
+    /// One shared temp path (`delegations.json.tmp-{pid}`) means concurrent
+    /// saves — an arm on the RPC path racing a settle write — can rename over
+    /// each other and lose the file. Serialize the write here.
+    save_lock: Mutex<()>,
     /// Serializes every settle path: worker pass, rechecks, boot, cancel.
     settle: tokio::sync::Mutex<()>,
     workspace: WorkspaceHost,
@@ -177,6 +181,7 @@ impl DelegationEngine {
                 file,
                 ledger: Mutex::new(ledger),
                 scheduled: Mutex::new(HashMap::new()),
+                save_lock: Mutex::new(()),
                 settle: tokio::sync::Mutex::new(()),
                 workspace,
                 doc_host,
@@ -554,6 +559,31 @@ impl DelegationEngine {
         });
     }
 
+    /// Test hook: run [`Self::settle`] as if a stale snapshot of this armed
+    /// message produced `outcome` — a re-armed message id must not match.
+    #[doc(hidden)]
+    pub async fn settle_armed(
+        &self,
+        chat_id: &str,
+        delegator: &str,
+        batch: &str,
+        message_id: &str,
+        outcome: Outcome,
+    ) {
+        self.settle(
+            &Armed {
+                chat_id: chat_id.into(),
+                delegator: delegator.into(),
+                batch: batch.into(),
+                message_id: message_id.into(),
+                asked: None,
+                settled: None,
+            },
+            outcome,
+        )
+        .await;
+    }
+
     /// An idle task's verdict: settled, still owed (message not in the
     /// transcript, a queued next turn, or own tasks outstanding), or still
     /// starting (a command is mid-execution).
@@ -627,11 +657,11 @@ impl DelegationEngine {
     async fn settle(&self, task: &Armed, outcome: Outcome) {
         {
             let mut ledger = lock(&self.inner.ledger);
-            if let Some(entry) = ledger
-                .tasks
-                .iter_mut()
-                .find(|t| t.chat_id == task.chat_id && t.settled.is_none())
-            {
+            // The verdict belongs to the armed message's turn: a re-arm with
+            // a new message id in between must not inherit it.
+            if let Some(entry) = ledger.tasks.iter_mut().find(|t| {
+                t.chat_id == task.chat_id && t.message_id == task.message_id && t.settled.is_none()
+            }) {
                 entry.settled = Some(Settled {
                     outcome,
                     at_ms: now_ms(),
@@ -830,7 +860,11 @@ impl DelegationEngine {
     }
 
     /// Atomic ledger write: temp file + rename, like the device-id file.
+    /// Callers on different paths (arm on the RPC path, settle on the
+    /// watcher) race, so serialize + rename happens under `save_lock` and the
+    /// last writer always holds the newest state.
     fn save(&self) -> Result<(), EngineError> {
+        let _save = lock(&self.inner.save_lock);
         let bytes = {
             let ledger = lock(&self.inner.ledger);
             serde_json::to_vec(&*ledger).map_err(|e| EngineError::Other(e.to_string()))?

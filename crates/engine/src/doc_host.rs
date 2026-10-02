@@ -5353,7 +5353,6 @@ impl DocHost {
         }
     }
 
-    /// Deliver a delegated-task notice to its delegator
     /// Stop `chat_id`'s in-flight turn and freeze its queue (`task_cancel`'s
     /// stop path — the same interrupt a Stop command runs).
     pub async fn interrupt_and_pause(&self, chat_id: &str) -> Result<bool, EngineError> {
@@ -5364,6 +5363,7 @@ impl DocHost {
         self.interrupt_and_pause_queue(&sessions, &handle).await
     }
 
+    /// Deliver a delegated-task notice to its delegator
     /// (docs/design/delegated-tasks.md). Distinct from `queue_message`/`deliver_prompt`
     /// on purpose: never revives an archived chat, never thaws a queue the user
     /// stopped, never interrupts a turn — a stopped or question-blocked

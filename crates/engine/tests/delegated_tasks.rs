@@ -2486,3 +2486,83 @@ async fn a_notice_waiting_in_a_queue_comes_back_frozen() {
     .await;
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_arms_never_corrupt_the_ledger_file() {
+    // arm() runs off the settle lock, so many of them racing a settle pass
+    // used to share one temp path and lose the rename.
+    let (_dir, core, _harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    for i in 0..20 {
+        delegate(&client, &core.device_id, "root", &format!("task-{i}"), None)
+            .await
+            .unwrap();
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let passer = {
+        let stop = stop.clone();
+        let delegation = core.delegation.clone();
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                delegation.run_pass().await;
+            }
+        })
+    };
+    let arms: Vec<_> = (0..50)
+        .map(|i| {
+            let delegation = core.delegation.clone();
+            tokio::spawn(async move {
+                delegation.arm(&format!("task-{}", i % 20), "b1", &format!("m-{i}"))
+            })
+        })
+        .collect();
+    let mut errors = Vec::new();
+    for arm in arms {
+        if let Err(err) = arm.await.unwrap() {
+            errors.push(err.to_string());
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    passer.await.unwrap();
+    assert!(errors.is_empty(), "arm errors: {errors:?}");
+    let file = std::fs::read_to_string(dir_path_ledger(&_dir)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&file).unwrap();
+    assert_eq!(
+        parsed["tasks"].as_array().unwrap().len(),
+        20,
+        "every task armed once: {file}"
+    );
+    core.shutdown().await;
+}
+
+fn dir_path_ledger(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    dir.path().join("orgs/dev-org/dev-user/delegations.json")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_settle_verdict_cannot_consume_a_re_arm() {
+    let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate(&client, &core.device_id, "root", "task-1", None)
+        .await
+        .unwrap();
+    run_chat(&client, "task-1", "m-task-1", "job", Some("b1")).await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    wait_for(|| notices(&core, "root").len() == 1, "the notice").await;
+
+    // Re-armed under a new message, then a stale verdict for the OLD
+    // message arrives — the new arming must survive.
+    core.delegation.arm("task-1", "b2", "m-task-2").unwrap();
+    core.delegation
+        .settle_armed("task-1", "root", "b1", "m-task-1", Outcome::Completed)
+        .await;
+    let entries = core.delegation.list();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].notice, "armed",
+        "the re-armed entry is untouched"
+    );
+    assert_eq!(notices(&core, "root").len(), 1, "no second notice");
+    core.shutdown().await;
+}
