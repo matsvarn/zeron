@@ -601,7 +601,11 @@ impl DelegationEngine {
         self.progress_release().await;
     }
 
+    /// Boot-time evaluation. Dispatches from here (delivered notices,
+    /// auto-sealed batches) run before the IPC listener's `set_ipc_port` —
+    /// wait briefly so those runs carry the zeron MCP server.
     async fn boot_pass(&self) {
+        self.inner.sessions.wait_ipc_ready().await;
         self.auto_seal_expired();
         self.evaluate_all().await;
         self.release_complete_batches().await;

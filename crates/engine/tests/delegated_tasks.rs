@@ -78,6 +78,16 @@ impl Held {
             .unwrap_or_default()
     }
 
+    fn last_request_for(&self, chat: &str) -> Option<RunRequest> {
+        self.runs
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(id, _)| id == chat)
+            .map(|(_, r)| r.clone())
+    }
+
     fn runs_for(&self, chat: &str) -> Vec<String> {
         self.runs
             .lock()
@@ -1703,7 +1713,7 @@ async fn a_batch_reports_once_when_every_task_has_settled() {
         .collect();
     assert!(positions[0] < positions[1] && positions[1] < positions[2]);
     assert_eq!(blocks(notice).len(), 3);
-    assert!(ledger(&core).is_empty());
+    wait_for(|| ledger(&core).is_empty(), "the batch to release").await;
     core.shutdown().await;
 }
 
@@ -1846,7 +1856,7 @@ async fn a_task_reports_only_after_its_own_tasks_have_settled() {
     harness.finish("task-p", Finish::Complete("P-FINAL".into()));
     wait_for(|| notices(&core, "root").len() == 1, "P's notice").await;
     assert!(notices(&core, "root")[0].contains("P-FINAL"));
-    assert!(ledger(&core).is_empty());
+    wait_for(|| ledger(&core).is_empty(), "the batch to release").await;
     core.shutdown().await;
 }
 
@@ -3067,8 +3077,10 @@ async fn an_armed_task_whose_turn_never_starts_settles_errored_after_the_grace()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_but_not_yet_delivered_message_is_not_stale() {
     let (_dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
-    // Zero grace: any absent message would settle immediately if not queued.
-    core.delegation.set_stale_arm_grace(Duration::ZERO);
+    // Small grace: the queue-command drain lands the row asynchronously, so
+    // zero would call even a genuinely queued message stale mid-drain.
+    core.delegation
+        .set_stale_arm_grace(Duration::from_millis(500));
     root(&core, "root");
     delegate(&client, &core.device_id, "root", "task-1", None)
         .await
@@ -3091,6 +3103,8 @@ async fn a_queued_but_not_yet_delivered_message_is_not_stale() {
     .await;
     // Re-arm: the message lands as a QUEUED row, not a transcript entry.
     run_chat(&client, "task-1", "m-queued", "more work", Some("b1")).await;
+    // The command's drain is async: wait for the queue row before the
+    // zero-grace settle pass, which would otherwise see an absent message.
     core.delegation.seal_batch("root", "b1").await;
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(
@@ -3751,4 +3765,58 @@ async fn a_crashed_turn_revives_and_completes() {
     assert!(notice[0].contains("completed"), "{}", notice[0]);
     assert!(notice[0].contains("RESULT"), "{}", notice[0]);
     core2.shutdown().await;
+}
+
+/// REGRESSION: a delegator woken by a boot-pass notice ran WITHOUT the zeron
+/// MCP server — the settle/deliver raced `set_ipc_port`, so the dispatched
+/// run's request.mcp was empty (live: the lead's restarted claude session
+/// had no zeron tools and could not call task_status). Dispatch must wait
+/// for the port instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_boot_notice_run_carries_the_zeron_mcp_server() {
+    let (dir, core, harness, client) = setup(SteeringMode::StepBoundary).await;
+    root(&core, "root");
+    delegate_run(&client, &core, "root", "task-1", "b1", "job").await;
+    wait_for(|| !harness.runs_for("task-1").is_empty(), "task run").await;
+    core.delegation.shutdown().await;
+    harness.finish("task-1", Finish::Complete("RESULT-1".into()));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    write_ledger(
+        dir.path(),
+        serde_json::json!([{
+            "chatId": "task-1",
+            "delegator": "root",
+            "batch": "b1",
+            "messageId": "m-task-1",
+            "settled": { "outcome": "completed", "atMs": 1 },
+        }]),
+    );
+    core.shutdown().await;
+    drop(core);
+
+    let harness = Held::new(SteeringMode::StepBoundary);
+    let core = assemble_at(dir.path(), harness.clone());
+    // The boot pass dispatches the notice's run while the port is still
+    // unknown — hold set_ipc_port back a beat to force that ordering.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    core.sessions.set_ipc_port(27655);
+    wait_for(|| notices(&core, "root").len() == 1, "boot pass delivers").await;
+    wait_for(
+        || !harness.runs_for("root").is_empty(),
+        "the delegator's wake-up run",
+    )
+    .await;
+    let runs = harness.runs_for("root");
+    assert_eq!(runs.len(), 1, "one wake-up run: {runs:?}");
+    // run() records the full request; grab its mcp via a fresh look.
+    let req = harness
+        .last_request_for("root")
+        .expect("the wake run request");
+    let mcp = req.mcp.expect("the run must carry the zeron MCP server");
+    assert_eq!(mcp.name, "zeron");
+    assert_eq!(
+        mcp.env.get("ZERON_CHAT_ID").map(String::as_str),
+        Some("root")
+    );
+    core.shutdown().await;
 }
