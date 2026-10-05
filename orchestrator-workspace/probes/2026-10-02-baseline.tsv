@@ -1,0 +1,12 @@
+case	lead	child	lead_parent	tools_visible	tool_name	child_created	child_reply_ok	parent_woken	notes
+A1	claude-code	codex	side-chat	yes	mcp__zeron__create_chat	no	-	-	rejected: "Side chats cannot create chats" (tools.rs:601)
+B1	codex	claude-code	side-chat	yes	mcp__zeron__create_chat	no	-	-	same rejection
+C1	devin	claude-code	side-chat	yes	create_chat	no	-	-	same rejection
+D1	cursor	codex	side-chat	-	-	no	-	-	lead errored: Invalid User API Key (Cursor not connected in Settings > Accounts)
+E1	pi	cursor	side-chat	yes	functions.zeron_create_chat	no	-	-	same rejection
+F1	claude-code	codex(async)	side-chat	yes	mcp__zeron__create_chat	no	-	-	same rejection
+A2	claude-code	codex	top-level	yes	mcp__zeron__create_chat	yes	PONG-A7Q	n/a(sync)	Claude loaded the deferred tool via ToolSearch first
+B2	codex	claude-code	top-level	yes	mcp__zeron__create_chat	yes	PONG-B3K	n/a(sync)	
+C2	devin	claude-code	top-level	yes	create_chat	yes	PONG-C9M	n/a(sync)	
+E2	pi	codex	top-level	yes	functions.zeron_create_chat	yes	PONG-E5R	n/a(sync)	
+F2	claude-code	codex(async)	top-level	yes	mcp__zeron__create_chat	yes	PONG-F8W	no	child done 10:48:13Z; parent transcript still 2 messages >30s later

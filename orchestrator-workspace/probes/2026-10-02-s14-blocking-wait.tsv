@@ -1,0 +1,8 @@
+scenario	lead	child	child_task	lead_started	child_created	child_done	lead_turn_end	call_result	child_reply_returned	notes
+calib	(none, direct MCP)	codex	sleep 5	-	-	-	-	ok	CALIB-OK	codex workspace-write runs sleep without an approval prompt
+S14	claude-code	codex	sleep 180	11:26:16Z	~11:26:29Z	~11:29:40Z	11:29:38Z	ok	SLEPT-S14CC	blocked ~3m10s, no harness tool timeout hit
+S14	codex	codex	sleep 180	11:26:16Z	11:26:29Z	11:29:40Z	11:27:12Z	backgrounded	no	Codex code mode returned "Script running with cell ID 1" (tool shown as running); lead treated it as an error and ended its turn ~43s after the child started; child finished 2.5 min later and the result never reached the lead
+S14	devin	codex	sleep 180	11:26:16Z	11:26:29Z	11:29:41Z	11:29:50Z	ok	SLEPT-S14DV	blocked ~3m30s, no timeout
+S14	pi	codex	sleep 180	11:26:16Z	~11:26:29Z	~11:29:40Z	11:29:45Z	ok	SLEPT-S14PI	blocked ~3m30s, no timeout
+S14-rerun2	codex	codex	sleep 180	11:32:52Z	~11:33:05Z	11:36:14Z	11:36:18Z	ok	SLEPT-S14CX2	blocked ~3m25s; call ran as a plain MCP call (tool not shown as running)
+S14-rerun3	codex	codex	sleep 180	11:32:52Z	~11:33:05Z	11:36:15Z	11:33:45Z	backgrounded	no	same failure as first run: "Script running with cell ID 1", lead ended turn ~53s in, result lost
