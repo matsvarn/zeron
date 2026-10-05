@@ -160,12 +160,31 @@ pub enum ReasoningLevel {
     Ultrathink,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxLevel {
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
+}
+
+impl SandboxLevel {
+    /// The level a row without a `config` runs at, matching the default the
+    /// engine applies when it builds a run from a chat row.
+    pub fn for_row(config: Option<&crate::entities::ChatConfig>) -> Self {
+        config
+            .map(|c| c.sandbox)
+            .unwrap_or(SandboxLevel::WorkspaceWrite)
+    }
+
+    /// Kebab-case wire name, for messages that name a level.
+    pub fn label(self) -> &'static str {
+        match self {
+            SandboxLevel::ReadOnly => "read-only",
+            SandboxLevel::WorkspaceWrite => "workspace-write",
+            SandboxLevel::DangerFullAccess => "danger-full-access",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

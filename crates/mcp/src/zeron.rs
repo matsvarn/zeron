@@ -735,6 +735,7 @@ mod tests {
             harness_session_id: None,
             harness_session_cwd: None,
             parent_chat_id: None,
+            delegation: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
