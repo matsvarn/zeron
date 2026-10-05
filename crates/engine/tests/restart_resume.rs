@@ -982,3 +982,96 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
     }
     core.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_done_journal_recovers_the_unstamped_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-quit").unwrap();
+
+    // Manufacture the on-disk state a graceful quit can leave: the journal
+    // got its Done{interrupted}, but the app exited before the doc's
+    // assistant entry was stamped — so the entry reads `streaming` forever.
+    // A Done-ended journal is not "stale", so nothing else visits this chat.
+    {
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-user-1".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "long task".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-quit".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "partial…".into(),
+            }],
+            created_at: 2,
+            device_id: "dev-quit".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+
+        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-quit".into(),
+                    assistant_message_id: "msg-assistant-1".into(),
+                },
+            )
+            .unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: Some("This operation was aborted".into()),
+                    session_id: None,
+                },
+            )
+            .unwrap();
+    }
+
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: Default::default(),
+            session_id: "hs-after-quit".into(),
+            fail_starts: Default::default(),
+        },
+    );
+    // Boot reconciliation stamped the quit-raced entry aborted, as the run's
+    // own Done would have.
+    let entries = entries_now(&core);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].status,
+        Some(MessageStatus::Aborted),
+        "a done journal's trailing streaming entry must be stamped at boot"
+    );
+    core.shutdown().await;
+}
