@@ -634,6 +634,11 @@ pub enum AgentEvent {
     Steered {
         assistant_message_id: Option<String>,
         next_assistant_message_id: Option<String>,
+        /// An internal harness turn (e.g. an input answer driven through the
+        /// same steer path), not an engine-routed message: the engine's
+        /// at-least-once steer ledger must not pop a pending send.
+        #[serde(default)]
+        internal: bool,
     },
     #[serde(rename_all = "camelCase")]
     Done {

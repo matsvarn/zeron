@@ -2647,6 +2647,7 @@ async fn drive_run(
         // A steer boundary splits the assistant entry exactly where the fold resets.
         if let AgentEvent::Steered {
             next_assistant_message_id,
+            internal,
             ..
         } = &event
         {
@@ -2675,11 +2676,17 @@ async fn drive_run(
             // the composer's optimistic overlay, which already reads 0:00).
             inner.set_status(&chat_id, SessionStatus::Working, true);
             // The boundary confirms delivery of the oldest accepted steer —
-            // retire its at-least-once ledger entry.
-            let confirmed = lock(&inner.runs)
-                .get(&chat_id)
-                .filter(|h| h.run_id == run_id)
-                .and_then(|h| lock(&h.routed_steers).pop_front());
+            // retire its at-least-once ledger entry. An internal boundary
+            // (a harness-side turn like a routed input answer) confirms
+            // nothing: the ledger only pops for routed sends.
+            let confirmed = (!*internal)
+                .then(|| {
+                    lock(&inner.runs)
+                        .get(&chat_id)
+                        .filter(|h| h.run_id == run_id)
+                        .and_then(|h| lock(&h.routed_steers).pop_front())
+                })
+                .flatten();
             // Consumed: a steer carrying the fork history delivered it to
             // this runtime's provider session.
             if confirmed.is_some_and(|steer| steer.fork_history)
