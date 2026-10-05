@@ -144,6 +144,11 @@ struct Inner {
     /// Loopback IPC port this engine serves, once known (0 = not serving):
     /// what the injected `zeron mcp` server dials back into.
     ipc_port: std::sync::atomic::AtomicU16,
+    /// Signalled when `ipc_port` becomes non-zero (the listener is bound).
+    ipc_ready: tokio::sync::Notify,
+    /// Set once `wait_ipc_ready` gave up — an embedder that never serves
+    /// IPC must not pay the bounded wait on every run it dispatches.
+    ipc_dead: std::sync::atomic::AtomicBool,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
@@ -196,6 +201,8 @@ impl SessionsEngine {
             inner: Arc::new(Inner {
                 device_id,
                 ipc_port: std::sync::atomic::AtomicU16::new(0),
+                ipc_ready: tokio::sync::Notify::new(),
+                ipc_dead: std::sync::atomic::AtomicBool::new(false),
                 journal,
                 registry,
                 doc_host: Mutex::new(None),
@@ -219,6 +226,14 @@ impl SessionsEngine {
         self.inner
             .ipc_port
             .store(port, std::sync::atomic::Ordering::Relaxed);
+        self.inner.ipc_ready.notify_waiters();
+    }
+
+    /// Bounded wait for the loopback IPC port — used by boot-time dispatch
+    /// paths (delegation notices, crash revival) that can run before
+    /// `set_ipc_port` lands.
+    pub(crate) async fn wait_ipc_ready(&self) {
+        self.inner.wait_ipc_ready().await;
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -905,6 +920,10 @@ impl SessionsEngine {
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();
             tokio::spawn(async move {
+                // The revival re-dispatches during assembly, possibly before
+                // the IPC listener binds — without it the run would miss the
+                // zeron MCP server.
+                sessions.inner.wait_ipc_ready().await;
                 let Some(host) = sessions.inner.doc_host() else {
                     return;
                 };
@@ -1254,6 +1273,29 @@ impl Inner {
             .into_iter()
             .collect(),
         })
+    }
+
+    /// Wait for the IPC port this engine will serve to be recorded —
+    /// bounded: dispatches during assembly (delegation boot-pass notices,
+    /// crash-revival) can race `set_ipc_port`, and an embedder that never
+    /// serves IPC marks the slot dead instead of paying the wait again.
+    pub(crate) async fn wait_ipc_ready(&self) {
+        // Register interest BEFORE checking the port: a set_ipc_port landing
+        // in between must not be missed (notify_waiters has no memory).
+        let notified = self.ipc_ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.ipc_port.load(std::sync::atomic::Ordering::Relaxed) != 0
+            || self.ipc_dead.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                self.ipc_dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
