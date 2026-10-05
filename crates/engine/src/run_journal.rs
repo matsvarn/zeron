@@ -236,6 +236,28 @@ impl RunJournal {
         Ok(raced)
     }
 
+    /// The chat's terminal `Done` status, when the journal's last line is
+    /// one — the most recent run's verdict. Last-line read only: journals
+    /// are never compacted, and this feeds per-chat state lookups.
+    pub fn last_done_status(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<zeron_proto::DoneStatus>, JournalError> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let last = read_last_line(&path)?.and_then(|line| {
+            serde_json::from_str::<JournalLine>(&line)
+                .ok()
+                .map(|row| row.event)
+        });
+        Ok(match last {
+            Some(AgentEvent::Done { status, .. }) => Some(status),
+            _ => None,
+        })
+    }
+
     /// Remove a chat's journal file entirely (tests / future compaction).
     pub fn discard(&self, chat_id: &str) -> Result<(), JournalError> {
         self.lock().remove(chat_id);

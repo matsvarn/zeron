@@ -17,7 +17,7 @@
 //! Every dying path must instead carry its own visible error (child crash with stderr,
 //! spawn failure, stream error, engine-restart recovery).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -157,6 +157,13 @@ struct Inner {
     doc_host: Mutex<Option<DocHost>>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
+    /// chat_id → message ids that must never start a run: cancellation's
+    /// stop fence. Lock order is `runs` → `stop_fences` everywhere —
+    /// `fence_messages` takes them in that order and the registration
+    /// check holds `runs` while consulting this set, so a start either
+    /// registered before the fence (and the final interrupt pass kills
+    /// it) or is refused. Process-local by design: not persisted.
+    stop_fences: Mutex<HashMap<String, HashSet<String>>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
     hubs: Mutex<HashMap<String, broadcast::Sender<JournaledEvent>>>,
     statuses: Mutex<HashMap<String, Session>>,
@@ -176,6 +183,10 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// Chats with a crash-recovery re-dispatch in flight: the status row is
+    /// briefly Idle between `recover_stale`'s stamp and the revived run's
+    /// Working, and a settle observer must not read that window as "ended".
+    reviving: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -207,6 +218,7 @@ impl SessionsEngine {
                 registry,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
+                stop_fences: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
                 sessions_tx,
@@ -215,6 +227,7 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                reviving: Mutex::new(std::collections::HashSet::new()),
             }),
         }
     }
@@ -292,6 +305,53 @@ impl SessionsEngine {
         self.inner.sessions_tx.subscribe()
     }
 
+    /// A run handle exists for this chat — its turn was dispatched and has
+    /// not ended. Status can transiently read Idle while the dispatch and
+    /// the Working stamp race a reader.
+    pub fn run_registered(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
+    }
+
+    /// Cancellation's stop fence: mark these message ids so any dispatch
+    /// path still holding them — a steer that fell back to a fresh run,
+    /// an orphaned-steer re-dispatch, a queue promotion that already took
+    /// its row — is refused at run registration instead of starting work
+    /// whose result will never be delivered. Takes `runs` first so a
+    /// currently registered run's pending routed steers are fenced too.
+    pub fn fence_messages(&self, chat_id: &str, ids: impl IntoIterator<Item = String>) {
+        let runs = lock(&self.inner.runs);
+        let mut fences = lock(&self.inner.stop_fences);
+        let set = fences.entry(chat_id.to_string()).or_default();
+        set.extend(ids);
+        if let Some(handle) = runs.get(chat_id) {
+            set.extend(
+                lock(&handle.routed_steers)
+                    .iter()
+                    .map(|steer| steer.message_id.clone()),
+            );
+        }
+    }
+
+    /// This message id is fenced — a dispatch carrying it must be refused.
+    pub fn message_fenced(&self, chat_id: &str, message_id: &str) -> bool {
+        lock(&self.inner.stop_fences)
+            .get(chat_id)
+            .is_some_and(|fenced| fenced.contains(message_id))
+    }
+
+    /// Test hook: drop the status entry without ending the run — the window
+    /// between `runs.insert` and the Working stamp, or a lost status write.
+    #[doc(hidden)]
+    pub fn clear_status_for_test(&self, chat_id: &str) {
+        lock(&self.inner.statuses).remove(chat_id);
+    }
+
+    /// A crash-recovery re-dispatch is in flight for this chat: its status
+    /// reads Idle for a moment, but its turn is starting over, not over.
+    pub fn is_reviving(&self, chat_id: &str) -> bool {
+        lock(&self.inner.reviving).contains(chat_id)
+    }
+
     pub fn session_status(&self, chat_id: &str) -> Option<Session> {
         lock(&self.inner.statuses).get(chat_id).cloned()
     }
@@ -307,6 +367,22 @@ impl SessionsEngine {
             .iter()
             .find(|d| d.id == harness)
             .is_some_and(HarnessDescriptor::steers_mid_turn)
+    }
+
+    /// The journal's terminal `Done` status for this chat, if its last
+    /// recorded event is one — the verdict of the most recent run, read
+    /// from the journal's last line only.
+    pub(crate) fn journal_last_done(&self, chat_id: &str) -> Option<zeron_proto::DoneStatus> {
+        self.inner.journal.last_done_status(chat_id).ok().flatten()
+    }
+
+    /// Live unanswered input-request ids for a chat — `awaiting` runs only;
+    /// empty for parked/unknown sessions.
+    pub(crate) fn pending_input_ids(&self, chat_id: &str) -> Vec<String> {
+        lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| lock(&h.pending_inputs).keys().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Whether this chat has a turn in flight — streaming, or parked on a
@@ -438,6 +514,21 @@ impl SessionsEngine {
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = crate::repos::expand_home(&request.cwd)
             .map_err(|error| EngineError::Other(error.to_string()))?;
+        // A delegated row's sandbox is the caller-asserted request value —
+        // clamp it to the level the row itself was granted. Creation rules
+        // only cover createChat; a follow-up send could still smuggle a
+        // higher level into the run request.
+        if let Some(row) = self
+            .inner
+            .workspace()
+            .and_then(|ws| ws.chat(chat_id).ok().flatten())
+            .filter(|c| c.delegation.is_some())
+        {
+            let own = zeron_proto::SandboxLevel::for_row(row.config.as_ref());
+            if request.sandbox > own {
+                request.sandbox = own;
+            }
+        }
         // Native-only catalog entries have no portable file fallback. Reject
         // cross-harness delivery before recording or routing the user turn.
         zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
@@ -543,6 +634,12 @@ impl SessionsEngine {
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
+        // Stop fence: this message id was captured by a cancellation — the
+        // command was already taken out of the doc but must not start a
+        // run. Write nothing; refuse.
+        if self.message_fenced(chat_id, &user_id) {
+            return Err(EngineError::Other("delegated task cancelled".into()));
+        }
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
@@ -603,7 +700,17 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
         };
 
-        lock(&self.inner.runs).insert(
+        // Authoritative fence check, atomic with the registration: a
+        // start either lands before the fence (the final interrupt pass
+        // kills it) or is refused — never slips through a gap.
+        let mut runs = lock(&self.inner.runs);
+        if lock(&self.inner.stop_fences)
+            .get(chat_id)
+            .is_some_and(|fenced| fenced.contains(&user_id))
+        {
+            return Err(EngineError::Other("delegated task cancelled".into()));
+        }
+        runs.insert(
             chat_id.to_string(),
             RunHandle {
                 run_id: run_id.clone(),
@@ -618,6 +725,7 @@ impl SessionsEngine {
                 fork_history_sent: fork_history_sent.clone(),
             },
         );
+        drop(runs);
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
@@ -919,12 +1027,14 @@ impl SessionsEngine {
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();
+            lock(&sessions.inner.reviving).insert(chat_id.clone());
             tokio::spawn(async move {
                 // The revival re-dispatches during assembly, possibly before
                 // the IPC listener binds — without it the run would miss the
                 // zeron MCP server.
                 sessions.inner.wait_ipc_ready().await;
                 let Some(host) = sessions.inner.doc_host() else {
+                    lock(&sessions.inner.reviving).remove(&chat_id);
                     return;
                 };
                 let request = sessions
@@ -950,6 +1060,7 @@ impl SessionsEngine {
                         })
                     });
                 let Some(mut request) = request else {
+                    lock(&sessions.inner.reviving).remove(&chat_id);
                     tracing::warn!(chat = %chat_id, "auto-resume skipped: no run config");
                     return;
                 };
@@ -974,8 +1085,12 @@ impl SessionsEngine {
                         tracing::warn!(chat = %chat_id, error = %err, "auto-resume dispatch failed")
                     }
                 }
+                // The dispatch registered the run (Working) or failed out of
+                // it — either way the revival window is over.
+                lock(&sessions.inner.reviving).remove(&chat_id);
             });
         }
+
         // Quit-fence reconciliation: a graceful quit writes Done to the
         // journal but the doc's entry stamp is not guaranteed to land (the
         // process can exit mid-write). A trailing Streaming assistant entry
@@ -2981,6 +3096,9 @@ async fn drive_run(
         let chat = chat_id.clone();
         tokio::spawn(async move {
             for steer in orphans {
+                if engine.message_fenced(&chat, &steer.message_id) {
+                    continue;
+                }
                 let Some(mut request) = engine.last_request(&chat) else {
                     tracing::warn!(chat = %chat, "orphaned steer lost: no run config to re-dispatch");
                     break;
@@ -3003,6 +3121,9 @@ async fn drive_run(
                     )
                     .await
                 {
+                    if engine.message_fenced(&chat, &steer.message_id) {
+                        break;
+                    }
                     tracing::warn!(chat = %chat, error = %err, "orphaned steer re-dispatch failed");
                     engine
                         .inner
