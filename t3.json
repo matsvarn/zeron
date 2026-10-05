@@ -1,0 +1,18 @@
+{
+  "$schema": "https://t3.codes/schema/t3.json",
+  "defaultThreadEnvMode": "worktree",
+  "scripts": [
+    {
+      "name": "Setup",
+      "command": "bash scripts/setup.sh",
+      "icon": "configure",
+      "runOnWorktreeCreate": true,
+      "async": false
+    },
+    {
+      "name": "Check",
+      "command": "bash scripts/ci/test-core.sh --build-jobs 2 --test-threads 2 && npm run typecheck --prefix edge && npm run test:unit --prefix edge -- --maxWorkers=2 && npm run test:workerd --prefix edge -- --maxWorkers=2",
+      "icon": "test"
+    }
+  ]
+}

@@ -33,6 +33,21 @@ sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
 
 Build and run the app with `cargo run -p zeron`.
 
+For a fresh clone or T3 worktree, run `bash scripts/setup.sh`. It fetches Cargo
+dependencies with `--locked`, installs `edge/package-lock.json` with `npm ci`,
+and builds the edge with Wrangler's local dry run. Use Node 24 as in edge CI.
+The script works from any directory and leaves source, credentials, installed
+apps, and services alone. The Rust app compiles on first `cargo build` or
+`cargo run`; native system prerequisites stay outside automatic setup.
+
+Import the Setup and Check actions from `t3.json` into each selected T3 project
+and environment. Setup runs on worktree creation and waits before the agent
+starts. Check reuses `scripts/ci/test-core.sh`, requiring cargo-nextest, then
+runs edge typechecks and both test tiers. It limits build and test workers to
+two. Follow [AGENTS.md](AGENTS.md) for parallel work, private state and native
+verification limits. Linux hosts also need a C compiler, such as Ubuntu's
+`build-essential`, in addition to the system libraries above.
+
 ### Running a dev build next to an installed Zeron
 
 An installed daemon holds the default data directory and IPC port. Give your
