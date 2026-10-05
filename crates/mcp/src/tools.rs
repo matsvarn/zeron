@@ -960,27 +960,59 @@ impl Tools {
 
     async fn respond_to_input(&self, args: RespondArgs) -> anyhow::Result<Value> {
         let chat = self.zeron.resolve_chat(&args.chat).await?;
+        // Validate against the chat's live pending request (the same source
+        // get_chat reports as pendingInput): a stale request id or a question
+        // id the request does not carry is silently dropped by the harness.
+        let entries = self
+            .zeron
+            .transcript_on(&chat.id, Some(&chat.device_id))
+            .await?;
+        let rendered = render_entries(&entries, RenderOptions::default());
+        let pending = last_pending_input(&rendered);
         let request_id = match args.request_id {
-            Some(id) => id,
-            None => {
-                let entries = self
-                    .zeron
-                    .transcript_on(&chat.id, Some(&chat.device_id))
-                    .await?;
-                let rendered = render_entries(&entries, RenderOptions::default());
-                last_pending_input(&rendered)
-                    .and_then(|p| {
-                        p.get("requestId")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("chat {} has no pending question", short(&chat.id))
-                    })?
+            Some(id) => {
+                let valid = pending
+                    .as_ref()
+                    .and_then(|p| p.get("requestId"))
+                    .and_then(Value::as_str);
+                anyhow::ensure!(
+                    valid == Some(id.as_str()),
+                    "chat {} is waiting on request {}, not {id:?}",
+                    short(&chat.id),
+                    valid.unwrap_or("none"),
+                );
+                id
             }
+            None => pending
+                .as_ref()
+                .and_then(|p| p.get("requestId"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("chat {} has no pending question", short(&chat.id))
+                })?,
         };
         if args.answers.is_empty() {
             anyhow::bail!("answers is empty");
+        }
+        let valid_ids: Vec<String> = pending
+            .as_ref()
+            .and_then(|p| p.get("questions"))
+            .and_then(Value::as_array)
+            .map(|qs| {
+                qs.iter()
+                    .filter_map(|q| q.get("id").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for answer in &args.answers {
+            anyhow::ensure!(
+                valid_ids.iter().any(|id| id == &answer.question_id),
+                "unknown question_id {:?} for chat {}; the pending request's question ids are: {}",
+                answer.question_id,
+                short(&chat.id),
+                valid_ids.join(", "),
+            );
         }
         let answers = args
             .answers
@@ -1247,6 +1279,8 @@ mod tests {
         writes: Mutex<Vec<(String, Value)>>,
         dispatch_barrier: Option<tokio::sync::Barrier>,
         beta_parent: Option<String>,
+        /// A pending question the transcript's last part carries.
+        pending: Option<Value>,
         beta_remote: bool,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
@@ -1319,13 +1353,22 @@ mod tests {
                 methods::LIST_MODELS => RpcReply::Value(json!([
                     { "id": "opus", "label": "Opus" }, { "id": "sonnet", "label": "Sonnet" }
                 ])),
-                methods::WATCH_DOC_MESSAGES => stream(json!({ "reset": [
-                    { "id": "u1", "role": "user", "createdAt": 1, "deviceId": "dev-local",
-                      "parts": [{ "kind": "text", "id": "t", "text": "hi" }] },
-                    { "id": "a1", "role": "assistant", "createdAt": 2, "deviceId": "dev-local",
-                      "status": "complete",
-                      "parts": [{ "kind": "text", "id": "t", "text": "hello back" }] }
-                ]})),
+                methods::WATCH_DOC_MESSAGES => {
+                    let mut entries = vec![
+                        json!({ "id": "u1", "role": "user", "createdAt": 1, "deviceId": "dev-local",
+                          "parts": [{ "kind": "text", "id": "t", "text": "hi" }] }),
+                        json!({ "id": "a1", "role": "assistant", "createdAt": 2, "deviceId": "dev-local",
+                          "status": "complete",
+                          "parts": [{ "kind": "text", "id": "t", "text": "hello back" }] }),
+                    ];
+                    if let Some(pending) = &self.pending {
+                        entries[1]["parts"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(pending.clone());
+                    }
+                    stream(json!({ "reset": entries }))
+                }
                 methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
                     self.writes
                         .lock()
@@ -2196,5 +2239,98 @@ mod tests {
             whoami["result"]["structuredContent"]["localDeviceId"],
             "dev-local"
         );
+    }
+
+    #[tokio::test]
+    async fn respond_to_input_rejects_an_unknown_question_id() {
+        let world = Arc::new(World {
+            pending: Some(json!({
+                "kind": "input", "id": "in-req-7", "requestId": "req-7",
+                "resolved": false,
+                "questions": [{
+                    "id": "q1", "header": "Choose", "question": "pick a color",
+                    "options": ["red", "blue"]
+                }]
+            })),
+            ..Default::default()
+        });
+        let tools = tools(world.clone(), Origin::default());
+        let err = tools
+            .call(
+                "respond_to_input",
+                json!({
+                    "chat": "alpha",
+                    "request_id": "req-7",
+                    "answers": [{ "question_id": "pick a color", "labels": ["red"] }]
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("unknown question_id"), "{err}");
+        assert!(err.contains("q1"), "{err}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn respond_to_input_rejects_a_stale_request_id() {
+        let world = Arc::new(World {
+            pending: Some(json!({
+                "kind": "input", "id": "in-req-7", "requestId": "req-7",
+                "resolved": false,
+                "questions": [{ "id": "q1", "header": "Q", "question": "pick", "options": ["red"] }]
+            })),
+            ..Default::default()
+        });
+        let tools = tools(world.clone(), Origin::default());
+        let err = tools
+            .call(
+                "respond_to_input",
+                json!({
+                    "chat": "alpha",
+                    "request_id": "req-old",
+                    "answers": [{ "question_id": "q1", "labels": ["red"] }]
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("req-7"), "{err}");
+        assert!(world.writes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn respond_to_input_accepts_a_valid_answer() {
+        let world = Arc::new(World {
+            pending: Some(json!({
+                "kind": "input", "id": "in-req-7", "requestId": "req-7",
+                "resolved": false,
+                "questions": [
+                    { "id": "q1", "header": "Q", "question": "pick", "options": ["red"] },
+                    { "id": "q2", "header": "Q", "question": "why", "options": [] }
+                ]
+            })),
+            ..Default::default()
+        });
+        let tools = tools(world.clone(), Origin::default());
+        let out = tools
+            .call(
+                "respond_to_input",
+                json!({
+                    "chat": "alpha",
+                    "answers": [
+                        { "question_id": "q1", "labels": ["red"] },
+                        { "question_id": "q2", "labels": ["because"] }
+                    ]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out["requestId"], "req-7");
+        let writes = world.writes.lock().unwrap();
+        let (_, p) = writes
+            .iter()
+            .find(|(m, _)| m == methods::QUEUE_COMMAND)
+            .unwrap();
+        assert_eq!(p["command"]["kind"], "respondInput");
+        assert_eq!(p["command"]["answers"][1]["questionId"], "q2");
     }
 }
